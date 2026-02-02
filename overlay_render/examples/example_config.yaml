@@ -1,0 +1,150 @@
+# overlay_render Configuration Example
+# =====================================
+#
+# This configuration file defines all parameters for rendering an overlay
+# video of a calcium imaging recording over a structural reference image.
+#
+# Usage:
+#   python -m overlay_render --config example_config.yaml
+#
+# Override individual parameters via CLI:
+#   python -m overlay_render --config example_config.yaml --view.gamma 1.5 --overlay.alpha 0.7
+
+# =============================================================================
+# INPUT FILES (Required)
+# =============================================================================
+
+# Path to the structure image (RFP reference, anatomical reference)
+# Supported formats: .tif, .tiff, .png
+structure_path: "/path/to/structure.tif"
+
+# Path to the recording (time-series movie)
+# Supported formats: .tif, .tiff (multi-page stack), .mp4, .avi
+recording_path: "/path/to/recording.tif"
+
+# Output directory for rendered video and report
+output_dir: "/path/to/output"
+
+# =============================================================================
+# METADATA FILES (Optional)
+# =============================================================================
+
+# Path to frames CSV with per-frame timing/odor state
+# Expected columns: frame (or frame_idx, index), odor_on (or odor, valve_open)
+frames_csv_path: null  # "/path/to/frames.csv"
+
+# Path to metadata JSON with experiment info and odor intervals
+# Expected keys: fps, odor_intervals (with start_frame/end_frame)
+metadata_json_path: "/path/to/metadata.json"
+
+# =============================================================================
+# OVERLAY SETTINGS
+# =============================================================================
+# Controls how the structure and recording are composited
+
+overlay:
+  # Alpha blending factor (0 = structure only, 1 = recording only)
+  alpha: 0.5
+
+  # Overlay mode:
+  #   - "blend": Simple alpha blending (grayscale)
+  #   - "falsecolor": Structure in red/magenta, recording in green
+  mode: "falsecolor"
+
+# =============================================================================
+# VIEW SCALING (Brightness/Contrast)
+# =============================================================================
+# View-only adjustments for visualization - no analysis operations
+
+view:
+  # Scaling method:
+  #   - "percentile": Scale based on percentile values (recommended)
+  #   - "minmax": Scale based on min/max values
+  method: "percentile"
+
+  # Percentile bounds (for percentile method)
+  # p_lo=1, p_hi=99 clips the darkest and brightest 1% of pixels
+  p_lo: 1
+  p_hi: 99
+
+  # Gamma correction (1.0 = linear, <1 = brighter, >1 = darker)
+  gamma: 1.0
+
+  # CLAHE (Contrast Limited Adaptive Histogram Equalization)
+  clahe: false
+  clahe_clip_limit: 2.0
+  clahe_tile_grid: [8, 8]
+
+# =============================================================================
+# REGISTRATION SETTINGS
+# =============================================================================
+# Aligns recording frames to the structure image
+
+registration:
+  # Enable/disable registration
+  enabled: true
+
+  # Registration model:
+  #   - "euclidean": Translation + rotation (rigid body)
+  #   - "affine": Translation + rotation + scaling + shearing
+  model: "affine"
+
+  # ECC algorithm parameters
+  ecc_iters: 200     # Maximum iterations
+  ecc_eps: 1e-6      # Convergence threshold
+
+  # Downscale factor for faster computation
+  # 2 = compute registration at half resolution
+  downscale: 2
+
+# =============================================================================
+# ANNOTATION SETTINGS
+# =============================================================================
+# Controls the "ODOR ON/OFF" annotation box
+
+annotation:
+  # Show box when odor is OFF? (default: false = only show when ON)
+  show_box_when_off: false
+
+  # Box appearance
+  box:
+    # Anchor position: "bottom_left", "bottom_right", "top_left", "top_right"
+    anchor: "bottom_left"
+    width_px: 520
+    height_px: 140
+    margin_px: 20
+
+  # Text appearance
+  # NOTE: "on" and "off" must be quoted because YAML treats them as booleans
+  text:
+    "on": "ODOR ON"
+    "off": "ODOR OFF"
+    font_scale: 1.6
+    thickness: 3
+
+# =============================================================================
+# TIMING SETTINGS
+# =============================================================================
+# Controls odor timing extraction from CSV/JSON
+
+timing:
+  # Frames per second (if null, inferred from recording or JSON)
+  fps: null
+
+  # Odor timing source preference:
+  #   - "auto": Try CSV first, then JSON
+  #   - "csv": Use only CSV
+  #   - "json": Use only JSON
+  odor_source: "auto"
+
+  # Column name candidates in CSV (first match wins)
+  frame_index_column_candidates:
+    - "frame"
+    - "frame_idx"
+    - "index"
+
+  odor_on_column_candidates:
+    - "odor_on"
+    - "odor"
+    - "valve_open"
+    - "odor_state"

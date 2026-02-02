@@ -1,0 +1,15 @@
+# Overlay render settings - tuned via preview GUI
+# Use with: python -m overlay_render --folder <path> --config these_settings.yaml
+
+view:
+  method: percentile
+  p_lo: 20
+  p_hi: 100
+  gamma: 0.7
+  clahe: true
+overlay:
+  alpha: 0.57
+  mode: falsecolor
+registration:
+  enabled: false
+  model: euclidean

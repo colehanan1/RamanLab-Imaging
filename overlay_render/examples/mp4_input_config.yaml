@@ -1,0 +1,58 @@
+# overlay_render Configuration - MP4 Input Example
+# =================================================
+#
+# Configuration for rendering overlay from an MP4 video recording
+# and a PNG/TIFF structure image.
+#
+# Typical use case: Behavioral videos or widefield imaging recordings
+# that have been converted to MP4.
+
+# Input paths
+structure_path: "/path/to/structure.png"
+recording_path: "/path/to/recording.mp4"
+
+# Output directory
+output_dir: "/path/to/output"
+
+# Optional metadata
+frames_csv_path: null
+metadata_json_path: "/path/to/metadata.json"
+
+overlay:
+  # Lower alpha since MP4 may already have good contrast
+  alpha: 0.4
+  # Blend mode works well for behavioral overlays
+  mode: "blend"
+
+view:
+  method: "percentile"
+  p_lo: 0.5
+  p_hi: 99.5
+  gamma: 1.0
+  clahe: false
+
+registration:
+  # May want to disable for behavioral videos
+  enabled: false
+  model: "euclidean"
+  ecc_iters: 100
+  ecc_eps: 1e-5
+  downscale: 4
+
+annotation:
+  show_box_when_off: false
+  box:
+    anchor: "bottom_left"
+    width_px: 400
+    height_px: 100
+    margin_px: 15
+  text:
+    "on": "STIMULUS"
+    "off": "BASELINE"
+    font_scale: 1.4
+    thickness: 2
+
+timing:
+  # FPS will be read from MP4 metadata if null
+  fps: null
+  odor_source: "json"

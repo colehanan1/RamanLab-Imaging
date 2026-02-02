@@ -1,0 +1,54 @@
+# overlay_render Configuration - TIFF Stack Example
+# ==================================================
+#
+# Configuration for rendering overlay from a multi-page TIFF stack recording
+# and a single TIFF structure image.
+#
+# Typical use case: Two-photon calcium imaging with RFP structure channel
+# and GCaMP recording saved as TIFF stacks.
+
+# Input paths - adjust to your data location
+structure_path: "/home/ramanlab/Documents/cole/Data/Imaging/Recordings-20260202/2xOdor_Pannel_GH146xOr7a_Female_d_post0h_20260202_112312/structure/structure_001.tif"
+recording_path: "/home/ramanlab/Documents/cole/Data/Imaging/Recordings-20260202/2xOdor_Pannel_GH146xOr7a_Female_d_post0h_20260202_112312/fly_1_geno_GH146xOr7a/trial_001_OFM_E/images/images/recording.tif"
+
+# Output directory
+output_dir: "/home/ramanlab/Documents/cole/Data/Imaging/Recordings-20260202/2xOdor_Pannel_GH146xOr7a_Female_d_post0h_20260202_112312/output"
+
+# Metadata - optional
+metadata_json_path: null
+
+overlay:
+  alpha: 0.6
+  mode: "falsecolor"
+
+view:
+  method: "percentile"
+  p_lo: 2
+  p_hi: 99.5
+  gamma: 1.2
+  clahe: false
+
+registration:
+  enabled: true
+  model: "euclidean"
+  ecc_iters: 200
+  ecc_eps: 1e-6
+  downscale: 2
+
+annotation:
+  show_box_when_off: false
+  box:
+    anchor: "bottom_left"
+    width_px: 520
+    height_px: 140
+    margin_px: 20
+  text:
+    "on": "ODOR ON"
+    "off": "ODOR OFF"
+    font_scale: 1.6
+    thickness: 3
+
+timing:
+  # IMPORTANT: Set FPS if not available in metadata
+  fps: 30.0
+  odor_source: "auto"
