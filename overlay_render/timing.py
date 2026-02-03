@@ -194,6 +194,10 @@ def _try_parse_csv(
     """
     Try to parse odor timing from CSV.
 
+    Supports two formats:
+    1. RamanLab timestamps.csv format with 'event', 'phase', 'frame' columns
+    2. Simple per-frame CSV with odor_on column
+
     Returns None if parsing fails or frame count doesn't match.
     """
     warnings = []
@@ -213,7 +217,14 @@ def _try_parse_csv(
     # Get column names
     columns = set(rows[0].keys())
 
-    # Find odor column
+    # Check for RamanLab timestamps.csv format (has 'event', 'phase', 'frame' columns)
+    if "event" in columns and "phase" in columns and "frame" in columns:
+        result = _parse_ramanlab_timestamps_csv(rows, n_frames)
+        if result is not None:
+            return result
+        # Fall through to try other formats
+
+    # Find odor column (for simple per-frame format)
     odor_col = None
     for candidate in odor_on_candidates:
         if candidate in columns:
@@ -264,13 +275,89 @@ def _try_parse_csv(
         )
         # Still try to use it if close
         if abs(len(odor_states) - n_frames) > n_frames * 0.1:
-            logger.warning("Frame count mismatch too large, skipping CSV")
+            logger.warning(f"Frame count mismatch too large, skipping CSV @{csv_path}")
             return None
 
     # Convert to intervals
     intervals = _states_to_intervals(odor_states)
 
     logger.info(f"Parsed {len(intervals)} odor intervals from CSV")
+    return intervals, warnings
+
+
+def _parse_ramanlab_timestamps_csv(
+    rows: List[dict],
+    n_frames: int
+) -> Optional[Tuple[List[OdorInterval], List[str]]]:
+    """
+    Parse RamanLab timestamps.csv format.
+
+    This format has:
+    - event: "FRAME_0", "FRAME_1", ..., "TRIAL_START", "ODOR_CMD", "ESP_RX", etc.
+    - phase: "BASELINE", "ODOR", "POST-ODOR", "PROTOCOL", "HOST", "ESP32"
+    - frame: frame number (int)
+    - odor: odor code like "OFM_H"
+
+    Odor is ON when phase == "ODOR" for frame rows.
+    """
+    warnings = []
+
+    # Filter to only FRAME_* rows
+    frame_rows = []
+    for row in rows:
+        event = row.get("event", "")
+        if event.startswith("FRAME_"):
+            frame_rows.append(row)
+
+    if not frame_rows:
+        logger.warning("No FRAME_* rows found in timestamps CSV")
+        return None
+
+    # Check frame count
+    csv_frame_count = len(frame_rows)
+    if csv_frame_count != n_frames:
+        warnings.append(
+            f"CSV has {csv_frame_count} frame rows but recording has {n_frames} frames"
+        )
+        # Allow small mismatch (within 5%)
+        if abs(csv_frame_count - n_frames) > n_frames * 0.05:
+            logger.warning(
+                f"Frame count mismatch: CSV has {csv_frame_count} frames, "
+                f"recording has {n_frames} frames"
+            )
+            # Don't return None - still try to use it
+
+    # Get odor name from first row
+    odor_name = frame_rows[0].get("odor") if frame_rows else None
+
+    # Parse odor states based on 'phase' column
+    odor_states = []
+    for row in frame_rows:
+        try:
+            frame_idx = int(row["frame"])
+        except (ValueError, KeyError):
+            continue
+
+        phase = row.get("phase", "").upper()
+        is_on = phase == "ODOR"
+        odor_states.append((frame_idx, is_on))
+
+    if not odor_states:
+        logger.warning("No valid frame states parsed from timestamps CSV")
+        return None
+
+    # Convert to intervals
+    intervals = _states_to_intervals(odor_states)
+
+    # Add odor name to intervals
+    if odor_name:
+        for interval in intervals:
+            interval.odor_name = odor_name
+
+    logger.info(
+        f"Parsed RamanLab timestamps.csv: {len(frame_rows)} frames, "
+        f"{len(intervals)} odor intervals"
+    )
     return intervals, warnings
 
 

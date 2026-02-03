@@ -63,10 +63,13 @@ def compute_file_hash(
     chunk_size: int = 65536
 ) -> str:
     """
-    Compute hash of a file for reproducibility tracking.
+    Compute hash of a file or directory for reproducibility tracking.
+
+    For directories (e.g., TIFF sequences), hashes the first few files
+    to create a representative hash.
 
     Args:
-        filepath: Path to file.
+        filepath: Path to file or directory.
         algorithm: Hash algorithm ('sha256', 'md5', etc.).
         chunk_size: Size of chunks to read.
 
@@ -74,24 +77,38 @@ def compute_file_hash(
         Hexadecimal hash string.
 
     Raises:
-        FileNotFoundError: If file doesn't exist.
+        FileNotFoundError: If file/directory doesn't exist.
         ValueError: If algorithm is not supported.
     """
     filepath = Path(filepath)
     if not filepath.exists():
-        raise FileNotFoundError(f"Cannot hash non-existent file: {filepath}")
+        raise FileNotFoundError(f"Cannot hash non-existent path: {filepath}")
 
     try:
         hasher = hashlib.new(algorithm)
     except ValueError:
         raise ValueError(f"Unsupported hash algorithm: {algorithm}")
 
-    with open(filepath, "rb") as f:
-        while True:
-            chunk = f.read(chunk_size)
-            if not chunk:
-                break
-            hasher.update(chunk)
+    if filepath.is_dir():
+        # For directories, hash the first few files (sorted) to create a representative hash
+        files = sorted(filepath.iterdir())[:10]  # First 10 files
+        for f in files:
+            if f.is_file():
+                hasher.update(f.name.encode())  # Include filename
+                with open(f, "rb") as fh:
+                    chunk = fh.read(chunk_size)  # Just first chunk of each file
+                    hasher.update(chunk)
+        # Also include directory name and file count
+        hasher.update(filepath.name.encode())
+        hasher.update(str(len(list(filepath.iterdir()))).encode())
+    else:
+        # Regular file
+        with open(filepath, "rb") as f:
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                hasher.update(chunk)
 
     return hasher.hexdigest()
 

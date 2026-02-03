@@ -16,6 +16,7 @@ import argparse
 import logging
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -94,6 +95,11 @@ Examples:
         default=None,
         help="Output directory (default: <folder>/output)"
     )
+    parser.add_argument(
+        "--reuse-output",
+        action="store_true",
+        help="Write into existing output directory (default: create run subfolder if output exists)"
+    )
 
     # Common options
     parser.add_argument(
@@ -145,6 +151,17 @@ Examples:
         default=None,
         help="YAML file with view/overlay/registration settings (use with --folder)"
     )
+    parser.add_argument(
+        "--recording-only",
+        action="store_true",
+        help="Render recording only (no structure overlay, grayscale output)"
+    )
+    parser.add_argument(
+        "--start-frame",
+        type=int,
+        default=None,
+        help="Start preview at this frame index (useful for finding bright frames)"
+    )
 
     # Parse known args to allow for override args
     args, unknown = parser.parse_known_args(argv)
@@ -195,25 +212,68 @@ def _parse_value(value: str):
     return value
 
 
-def run_pipeline(config: OverlayConfig, save_thumbnail_flag: bool = True) -> dict:
+def _resolve_output_dir(
+    folder: Path,
+    output_dir: Optional[Path],
+    reuse_output: bool,
+) -> Path:
+    """
+    Resolve output directory for folder mode.
+
+    If output_dir already exists and has content, create a run subfolder
+    unless reuse_output is True.
+    """
+    if output_dir is None:
+        output_dir = folder / "output"
+    output_dir = Path(output_dir)
+
+    if not reuse_output and output_dir.exists():
+        try:
+            has_contents = any(output_dir.iterdir())
+        except PermissionError:
+            has_contents = True
+        if has_contents:
+            run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_dir = output_dir / f"run_{run_id}"
+            logger.warning(
+                "Existing output found; writing to new run folder: %s "
+                "(use --reuse-output to write into existing folder)",
+                output_dir
+            )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
+def run_pipeline(config: OverlayConfig, save_thumbnail_flag: bool = True, recording_only: bool = False) -> dict:
     """
     Run the full overlay rendering pipeline.
 
     Args:
         config: Validated configuration.
         save_thumbnail_flag: Whether to save thumbnail image.
+        recording_only: If True, render only the recording (grayscale, no overlay).
 
     Returns:
         Report dictionary.
     """
     start_time = time.time()
 
-    # Step 1: Load structure image
-    logger.info("=" * 60)
-    logger.info("STEP 1: Loading structure image")
-    logger.info("=" * 60)
-    structure = load_structure(config.structure_path)
-    logger.info(f"Structure shape: {structure.shape}, dtype: {structure.dtype}")
+    if recording_only:
+        logger.info("=" * 60)
+        logger.info("RECORDING-ONLY MODE (no structure overlay)")
+        logger.info("=" * 60)
+
+    # Step 1: Load structure image (skip if recording_only)
+    structure = None
+    if not recording_only:
+        logger.info("=" * 60)
+        logger.info("STEP 1: Loading structure image")
+        logger.info("=" * 60)
+        structure = load_structure(config.structure_path)
+        logger.info(f"Structure shape: {structure.shape}, dtype: {structure.dtype}")
+    else:
+        logger.info("Skipping structure loading (recording-only mode)")
 
     # Step 2: Load recording
     logger.info("=" * 60)
@@ -250,20 +310,25 @@ def run_pipeline(config: OverlayConfig, save_thumbnail_flag: bool = True) -> dic
     if len(timing_result.intervals) > 5:
         logger.info(f"  ... and {len(timing_result.intervals) - 5} more")
 
-    # Step 4: Registration
-    logger.info("=" * 60)
-    logger.info("STEP 4: Computing registration")
-    logger.info("=" * 60)
-    registration = FrameRegistration(structure, config.registration)
+    # Step 4: Registration (skip if recording_only)
+    registration = None
+    registration_result = None
+    if not recording_only and structure is not None:
+        logger.info("=" * 60)
+        logger.info("STEP 4: Computing registration")
+        logger.info("=" * 60)
+        registration = FrameRegistration(structure, config.registration)
 
-    # Get representative frame for registration
-    rep_idx = get_representative_frame_index(recording.n_frames, method="median")
-    rep_frame = recording.get_frame(rep_idx)
-    logger.info(f"Using frame {rep_idx} as registration reference")
+        # Get representative frame for registration
+        rep_idx = get_representative_frame_index(recording.n_frames, method="median")
+        rep_frame = recording.get_frame(rep_idx)
+        logger.info(f"Using frame {rep_idx} as registration reference")
 
-    registration_result = registration.initialize(rep_frame)
-    logger.info(f"Registration converged: {registration_result.converged}")
-    logger.info(f"Registration correlation: {registration_result.correlation:.4f}")
+        registration_result = registration.initialize(rep_frame)
+        logger.info(f"Registration converged: {registration_result.converged}")
+        logger.info(f"Registration correlation: {registration_result.correlation:.4f}")
+    else:
+        logger.info("Skipping registration (recording-only mode)")
 
     # Step 5: Compute global scaling parameters
     logger.info("=" * 60)
@@ -276,30 +341,40 @@ def run_pipeline(config: OverlayConfig, save_thumbnail_flag: bool = True) -> dic
     logger.info(f"Scaling: vmin={scaling_params.vmin:.2f}, vmax={scaling_params.vmax:.2f}")
     logger.info(f"Gamma: {scaling_params.gamma}, CLAHE: {scaling_params.use_clahe}")
 
-    # Step 6: Initialize overlay renderer
-    logger.info("=" * 60)
-    logger.info("STEP 6: Initializing overlay renderer")
-    logger.info("=" * 60)
+    # Step 6: Initialize overlay renderer (skip if recording_only)
+    overlay_renderer = None
+    if not recording_only and structure is not None:
+        logger.info("=" * 60)
+        logger.info("STEP 6: Initializing overlay renderer")
+        logger.info("=" * 60)
 
-    # Scale structure for display
-    from .view_scaling import _compute_single_image_params, scale_frame as scale_single
-    struct_params = _compute_single_image_params(structure, config.view)
-    structure_scaled = scale_single(structure, struct_params)
+        # Scale structure for display
+        from .view_scaling import _compute_single_image_params, scale_frame as scale_single
+        struct_params = _compute_single_image_params(structure, config.view)
+        structure_scaled = scale_single(structure, struct_params)
 
-    overlay_renderer = OverlayRenderer(structure_scaled, config.overlay)
+        overlay_renderer = OverlayRenderer(structure_scaled, config.overlay)
+    else:
+        logger.info("Skipping overlay renderer (recording-only mode)")
 
     # Step 7: Render video
     logger.info("=" * 60)
-    logger.info("STEP 7: Rendering overlay video")
+    logger.info("STEP 7: Rendering video")
     logger.info("=" * 60)
 
     # Output paths
     stem = Path(config.recording_path).stem
     if Path(config.recording_path).is_dir():
         stem = Path(config.recording_path).parent.parent.name  # Use trial name
-    output_video = config.output_dir / f"{stem}_overlay.mp4"
+
+    # Different output name for recording-only mode
+    if recording_only:
+        output_video = config.output_dir / f"{stem}_recording.mp4"
+        output_thumbnail = config.output_dir / f"{stem}_recording_thumbnail.png"
+    else:
+        output_video = config.output_dir / f"{stem}_overlay.mp4"
+        output_thumbnail = config.output_dir / f"{stem}_thumbnail.png"
     output_report = config.output_dir / f"{stem}_report.json"
-    output_thumbnail = config.output_dir / f"{stem}_thumbnail.png"
 
     thumbnail_frame = None
     thumbnail_idx = recording.n_frames // 2
@@ -314,14 +389,22 @@ def run_pipeline(config: OverlayConfig, save_thumbnail_flag: bool = True) -> dic
             # Get frame
             raw_frame = recording.get_frame(frame_idx)
 
-            # Apply registration
-            registered_frame = registration.apply(raw_frame)
+            # Apply registration (if enabled and not recording_only)
+            if registration is not None:
+                registered_frame = registration.apply(raw_frame)
+            else:
+                registered_frame = raw_frame
 
             # Apply view scaling
             scaled_frame = scale_frame(registered_frame, scaling_params)
 
-            # Create overlay
-            composite = overlay_renderer.render(scaled_frame)
+            # Create output frame
+            if recording_only:
+                # Grayscale: convert to 3-channel for video writer
+                composite = np.stack([scaled_frame, scaled_frame, scaled_frame], axis=-1)
+            else:
+                # Create overlay
+                composite = overlay_renderer.render(scaled_frame)
 
             # Add annotation
             is_odor_on = timing_result.is_odor_on(frame_idx)
@@ -378,7 +461,9 @@ def run_folder_mode(
     structure_index: int,
     save_thumbnail_flag: bool,
     dry_run: bool,
-    settings_overrides: Optional[dict] = None
+    reuse_output: bool,
+    settings_overrides: Optional[dict] = None,
+    recording_only: bool = False
 ) -> int:
     """
     Run in folder auto-discovery mode.
@@ -404,9 +489,7 @@ def run_folder_mode(
     experiment = discover_experiment(folder)
 
     # Set output directory
-    if output_dir is None:
-        output_dir = folder / "output"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = _resolve_output_dir(folder, output_dir, reuse_output=reuse_output)
 
     # Select structure image
     if structure_index >= len(experiment.structure_files):
@@ -498,7 +581,7 @@ def run_folder_mode(
                         config.registration.model = reg["model"]
 
             # Run pipeline
-            run_pipeline(config, save_thumbnail_flag=save_thumbnail_flag)
+            run_pipeline(config, save_thumbnail_flag=save_thumbnail_flag, recording_only=recording_only)
             success_count += 1
 
         except Exception as e:
@@ -562,10 +645,29 @@ def main(argv: Optional[List[str]] = None) -> int:
                 return 1
 
             logger.info(f"Loaded {len(frames)} preview frames")
-            gui = PreviewGUI(structure, frames)
+
+            # Determine start frame for preview
+            start_frame = args.start_frame
+            if start_frame is not None:
+                # Map actual frame index to preview frame index
+                # Preview samples evenly, so map to closest
+                total_frames_approx = len(frames) * (340 // len(frames))  # Rough estimate
+                preview_idx = int(start_frame / total_frames_approx * len(frames))
+                start_frame = min(max(0, preview_idx), len(frames) - 1)
+                logger.info(f"Starting at preview frame {start_frame} (requested ~frame {args.start_frame})")
+
+            gui = PreviewGUI(
+                structure,
+                frames,
+                recording_only=args.recording_only,
+                start_frame=start_frame
+            )
             settings = gui.run()
 
-            logger.info("Preview closed. Use saved settings with --config tuned_settings.yaml")
+            if args.recording_only:
+                logger.info("Preview closed. Use saved settings with --settings tuned_settings.yaml --recording-only")
+            else:
+                logger.info("Preview closed. Use saved settings with --settings tuned_settings.yaml")
             return 0
 
         # Load settings file if provided
@@ -588,7 +690,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                 structure_index=args.structure_index,
                 save_thumbnail_flag=save_thumb,
                 dry_run=args.dry_run,
-                settings_overrides=settings_overrides
+                reuse_output=args.reuse_output,
+                settings_overrides=settings_overrides,
+                recording_only=args.recording_only
             )
 
         else:

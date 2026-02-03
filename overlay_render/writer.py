@@ -73,20 +73,19 @@ class VideoWriter:
             h, w = first_frame.shape[:2]
             self.frame_size = (w, h)
 
-        # FFmpeg output parameters
-        output_params = [
-            "-vcodec", self.codec,
-            "-crf", str(max(1, 51 - self.quality * 5)),  # Convert quality to CRF
-            "-pix_fmt", self.pixel_format,
-            "-preset", "medium",  # Balance speed/quality
-        ]
-
+        # FFmpeg output parameters - use codec and pixelformat kwargs instead of
+        # output_params to avoid duplicate option warnings from imageio
         self._writer = get_writer(
             str(self.output_path),
             fps=self.fps,
             mode="I",
             format="FFMPEG",
-            output_params=output_params,
+            codec=self.codec,
+            pixelformat=self.pixel_format,
+            output_params=[
+                "-crf", str(max(1, 51 - self.quality * 5)),  # Quality setting
+                "-preset", "medium",  # Balance speed/quality
+            ],
         )
 
         self._initialized = True

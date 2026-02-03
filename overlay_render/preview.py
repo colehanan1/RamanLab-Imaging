@@ -34,20 +34,35 @@ class PreviewGUI:
         self,
         structure: np.ndarray,
         recording_frames: list,
-        window_name: str = "Overlay Preview - Press 'q' to quit, 's' to save settings"
+        window_name: str = "Overlay Preview - Press 'q' to quit, 's' to save settings",
+        recording_only: bool = False,
+        start_frame: int = None
     ):
         """
         Initialize preview GUI.
 
         Args:
-            structure: Structure image (2D array).
+            structure: Structure image (2D array). Can be None if recording_only.
             recording_frames: List of recording frames to preview.
             window_name: OpenCV window name.
+            recording_only: If True, show only recording (grayscale, no overlay).
+            start_frame: Initial frame index to display.
         """
-        self.structure = structure.astype(np.float32)
+        self.recording_only = recording_only
         self.recording_frames = [f.astype(np.float32) for f in recording_frames]
-        self.window_name = window_name
-        self.current_frame_idx = len(recording_frames) // 2
+
+        if recording_only:
+            self.structure = None
+            self.window_name = "Recording Preview - Press 'q' to quit, 's' to save settings"
+        else:
+            self.structure = structure.astype(np.float32) if structure is not None else None
+            self.window_name = window_name
+
+        # Set initial frame
+        if start_frame is not None and 0 <= start_frame < len(recording_frames):
+            self.current_frame_idx = start_frame
+        else:
+            self.current_frame_idx = len(recording_frames) // 2
 
         # Parameters (will be controlled by trackbars)
         self.p_lo = 1
@@ -59,9 +74,13 @@ class PreviewGUI:
         self.overlay_mode = 0  # 0 = falsecolor, 1 = blend
         self.roi_center = 100  # 100 = full image, 50 = center 50%
 
-        # Precompute structure stats
-        self.struct_min = float(np.percentile(self.structure, 1))
-        self.struct_max = float(np.percentile(self.structure, 99))
+        # Precompute structure stats (if not recording_only)
+        if self.structure is not None:
+            self.struct_min = float(np.percentile(self.structure, 1))
+            self.struct_max = float(np.percentile(self.structure, 99))
+        else:
+            self.struct_min = 0
+            self.struct_max = 1
 
         # Registration matrix (computed once if enabled)
         self._registration_matrix = None
@@ -76,14 +95,18 @@ class PreviewGUI:
         # Resize window to reasonable size
         cv2.resizeWindow(self.window_name, 1200, 900)
 
-        # Create trackbars
-        cv2.createTrackbar("p_lo", self.window_name, self.p_lo, 20, self._on_trackbar)
-        cv2.createTrackbar("p_hi", self.window_name, self.p_hi, 100, self._on_trackbar)
+        # Create trackbars - full 0-100 range for percentiles
+        cv2.createTrackbar("p_lo (MIN)", self.window_name, self.p_lo, 100, self._on_trackbar)
+        cv2.createTrackbar("p_hi (MAX)", self.window_name, self.p_hi, 100, self._on_trackbar)
         cv2.createTrackbar("gamma x10", self.window_name, self.gamma, 30, self._on_trackbar)
-        cv2.createTrackbar("alpha %", self.window_name, self.alpha, 100, self._on_trackbar)
+
+        # Only show overlay controls if not recording_only
+        if not self.recording_only:
+            cv2.createTrackbar("alpha %", self.window_name, self.alpha, 100, self._on_trackbar)
+            cv2.createTrackbar("Registration", self.window_name, 0, 1, self._on_trackbar)
+            cv2.createTrackbar("Mode (0=false,1=blend)", self.window_name, 0, 1, self._on_trackbar)
+
         cv2.createTrackbar("CLAHE", self.window_name, 0, 1, self._on_trackbar)
-        cv2.createTrackbar("Registration", self.window_name, 0, 1, self._on_trackbar)
-        cv2.createTrackbar("Mode (0=false,1=blend)", self.window_name, 0, 1, self._on_trackbar)
         cv2.createTrackbar("ROI center %", self.window_name, self.roi_center, 100, self._on_trackbar)
         cv2.createTrackbar("Frame", self.window_name, self.current_frame_idx,
                           len(self.recording_frames) - 1, self._on_trackbar)
@@ -94,29 +117,45 @@ class PreviewGUI:
 
     def _read_trackbars(self):
         """Read current trackbar values."""
-        self.p_lo = cv2.getTrackbarPos("p_lo", self.window_name)
-        self.p_hi = cv2.getTrackbarPos("p_hi", self.window_name)
+        self.p_lo = cv2.getTrackbarPos("p_lo (MIN)", self.window_name)
+        self.p_hi = cv2.getTrackbarPos("p_hi (MAX)", self.window_name)
         self.gamma = cv2.getTrackbarPos("gamma x10", self.window_name)
-        self.alpha = cv2.getTrackbarPos("alpha %", self.window_name)
         self.use_clahe = cv2.getTrackbarPos("CLAHE", self.window_name) == 1
-        self.use_registration = cv2.getTrackbarPos("Registration", self.window_name) == 1
-        self.overlay_mode = cv2.getTrackbarPos("Mode (0=false,1=blend)", self.window_name)
         self.roi_center = cv2.getTrackbarPos("ROI center %", self.window_name)
         self.current_frame_idx = cv2.getTrackbarPos("Frame", self.window_name)
 
-        # Clamp values
-        self.p_lo = max(0, min(self.p_lo, self.p_hi - 1))
-        self.gamma = max(1, self.gamma)  # Minimum 0.1
-        self.roi_center = max(10, self.roi_center)  # Minimum 10%
+        # Only read overlay controls if not recording_only
+        if not self.recording_only:
+            self.alpha = cv2.getTrackbarPos("alpha %", self.window_name)
+            self.use_registration = cv2.getTrackbarPos("Registration", self.window_name) == 1
+            self.overlay_mode = cv2.getTrackbarPos("Mode (0=false,1=blend)", self.window_name)
 
-    def _scale_image(self, img: np.ndarray, p_lo: float, p_hi: float) -> np.ndarray:
-        """Apply percentile scaling to image."""
-        vmin = np.percentile(img, p_lo)
-        vmax = np.percentile(img, p_hi)
+        # Only ensure p_lo < p_hi (allow full 0-100 range)
+        if self.p_lo >= self.p_hi:
+            self.p_lo = max(0, self.p_hi - 1)
+        # Allow gamma down to 0.1 (trackbar value 1)
+        self.gamma = max(1, self.gamma)
+        # Allow ROI down to 1% (but not 0 to avoid division issues)
+        self.roi_center = max(1, self.roi_center)
+
+    def _scale_image(self, img: np.ndarray, p_lo: float, p_hi: float, roi_fraction: float = 1.0) -> np.ndarray:
+        """Apply percentile scaling to image, optionally using center ROI for stats."""
+        # Use center ROI for computing percentiles if roi_fraction < 1
+        if roi_fraction < 1.0:
+            h, w = img.shape[:2]
+            margin_h = int(h * (1 - roi_fraction) / 2)
+            margin_w = int(w * (1 - roi_fraction) / 2)
+            roi = img[margin_h:h-margin_h, margin_w:w-margin_w]
+        else:
+            roi = img
+
+        vmin = np.percentile(roi, p_lo)
+        vmax = np.percentile(roi, p_hi)
 
         if vmax <= vmin:
             vmax = vmin + 1
 
+        # Scale the FULL image using ROI-derived stats
         scaled = (img - vmin) / (vmax - vmin)
         scaled = np.clip(scaled, 0, 1)
         return scaled
@@ -212,25 +251,48 @@ class PreviewGUI:
 
         # Settings text
         gamma_val = self.gamma / 10.0
-        alpha_val = self.alpha / 100.0
-        mode_str = "falsecolor" if self.overlay_mode == 0 else "blend"
+        roi_pct = self.roi_center
 
-        lines = [
-            f"p_lo: {self.p_lo}  p_hi: {self.p_hi}  gamma: {gamma_val:.1f}",
-            f"alpha: {alpha_val:.2f}  mode: {mode_str}",
-            f"CLAHE: {'ON' if self.use_clahe else 'OFF'}  Registration: {'ON' if self.use_registration else 'OFF'}",
-            f"Frame: {self.current_frame_idx + 1}/{len(self.recording_frames)}",
-            "",
-            "Keys: 's'=save  'q'=quit  '['/']=frame  'r'=reg  'c'=clahe  'm'=mode"
-        ]
+        if self.recording_only:
+            lines = [
+                "=== BRIGHTNESS/CONTRAST (like Fiji) ===",
+                f"p_lo: {self.p_lo}   <- MIN: slide RIGHT to darken background",
+                f"p_hi: {self.p_hi}  <- MAX: slide LEFT to brighten signal",
+                f"gamma: {gamma_val:.1f}  <- midtone adjust (1.0 = off)",
+                f"ROI: {roi_pct}%   <- area used for min/max calc (lower = center only)",
+                f"CLAHE: {'ON' if self.use_clahe else 'OFF'}    <- local contrast enhancement",
+                "",
+                f"Frame: {self.current_frame_idx + 1}/{len(self.recording_frames)}  |  MODE: RECORDING ONLY",
+                "",
+                "Keys: 's'=SAVE  'q'=quit  '['/']=frame  'c'=clahe"
+            ]
+        else:
+            alpha_val = self.alpha / 100.0
+            mode_str = "falsecolor" if self.overlay_mode == 0 else "blend"
+            lines = [
+                "=== BRIGHTNESS/CONTRAST ===",
+                f"p_lo: {self.p_lo}   <- MIN: slide RIGHT to darken background",
+                f"p_hi: {self.p_hi}  <- MAX: slide LEFT to brighten signal",
+                f"gamma: {gamma_val:.1f}  <- midtone adjust (1.0 = off)",
+                f"ROI: {roi_pct}%   <- area for min/max calc",
+                "",
+                "=== OVERLAY ===",
+                f"alpha: {alpha_val:.2f}  <- recording blend (1=full green, 0=full magenta)",
+                f"mode: {mode_str}  <- falsecolor=pink+green, blend=grayscale",
+                f"CLAHE: {'ON' if self.use_clahe else 'OFF'}  Reg: {'ON' if self.use_registration else 'OFF'}",
+                "",
+                f"Frame: {self.current_frame_idx + 1}/{len(self.recording_frames)}",
+                "",
+                "Keys: 's'=SAVE  'q'=quit  '['/']=frame  'r'=reg  'c'=clahe  'm'=mode"
+            ]
 
         y = 30
         for line in lines:
             cv2.putText(img_display, line, (10, y),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             cv2.putText(img_display, line, (10, y),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 1)
-            y += 25
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+            y += 22
 
         return img_display
 
@@ -241,28 +303,34 @@ class PreviewGUI:
         # Get current recording frame
         frame = self.recording_frames[self.current_frame_idx]
 
-        # Apply registration if enabled
-        if self.use_registration:
+        # Apply registration if enabled (only for overlay mode)
+        if not self.recording_only and self.use_registration:
             frame = self._apply_registration(frame)
 
         # Scale images
         gamma_val = self.gamma / 10.0
         alpha_val = self.alpha / 100.0
+        roi_fraction = self.roi_center / 100.0
 
-        struct_scaled = self._scale_image(self.structure, self.p_lo, self.p_hi)
-        frame_scaled = self._scale_image(frame, self.p_lo, self.p_hi)
+        frame_scaled = self._scale_image(frame, self.p_lo, self.p_hi, roi_fraction)
 
         # Apply gamma
-        struct_scaled = self._apply_gamma(struct_scaled, gamma_val)
         frame_scaled = self._apply_gamma(frame_scaled, gamma_val)
 
         # Apply CLAHE if enabled
         if self.use_clahe:
-            struct_scaled = self._apply_clahe(struct_scaled)
             frame_scaled = self._apply_clahe(frame_scaled)
 
-        # Create overlay
-        composite = self._create_overlay(struct_scaled, frame_scaled, alpha_val, self.overlay_mode)
+        if self.recording_only:
+            # Grayscale output - stack to 3 channels
+            composite = np.stack([frame_scaled, frame_scaled, frame_scaled], axis=-1)
+        else:
+            # Overlay mode
+            struct_scaled = self._scale_image(self.structure, self.p_lo, self.p_hi, roi_fraction)
+            struct_scaled = self._apply_gamma(struct_scaled, gamma_val)
+            if self.use_clahe:
+                struct_scaled = self._apply_clahe(struct_scaled)
+            composite = self._create_overlay(struct_scaled, frame_scaled, alpha_val, self.overlay_mode)
 
         # Add info text
         display = self._add_info_text(composite)
@@ -272,10 +340,9 @@ class PreviewGUI:
     def get_settings(self) -> dict:
         """Get current settings as config dict."""
         gamma_val = self.gamma / 10.0
-        alpha_val = self.alpha / 100.0
-        mode_str = "falsecolor" if self.overlay_mode == 0 else "blend"
+        roi_fraction = self.roi_center / 100.0
 
-        return {
+        settings = {
             "view": {
                 "method": "percentile",
                 "p_lo": self.p_lo,
@@ -283,15 +350,26 @@ class PreviewGUI:
                 "gamma": gamma_val,
                 "clahe": self.use_clahe,
             },
-            "overlay": {
+        }
+
+        # Only include overlay/registration settings if not recording_only
+        if not self.recording_only:
+            alpha_val = self.alpha / 100.0
+            mode_str = "falsecolor" if self.overlay_mode == 0 else "blend"
+            settings["overlay"] = {
                 "alpha": alpha_val,
                 "mode": mode_str,
-            },
-            "registration": {
+            }
+            settings["registration"] = {
                 "enabled": self.use_registration,
                 "model": "euclidean",
-            },
-        }
+            }
+
+        # Only include roi_center_fraction if not using full image
+        if roi_fraction < 1.0:
+            settings["view"]["roi_center_fraction"] = roi_fraction
+
+        return settings
 
     def save_settings(self, path: Path):
         """Save current settings to YAML file."""
@@ -300,8 +378,14 @@ class PreviewGUI:
         settings = self.get_settings()
 
         # Add comment header
-        yaml_str = """# Overlay render settings - tuned via preview GUI
-# Use with: python -m overlay_render --folder <path> --config these_settings.yaml
+        if self.recording_only:
+            yaml_str = """# Recording-only render settings - tuned via preview GUI
+# Use with: python -m overlay_render --folder <path> --settings this_file.yaml --recording-only
+
+"""
+        else:
+            yaml_str = """# Overlay render settings - tuned via preview GUI
+# Use with: python -m overlay_render --folder <path> --settings this_file.yaml
 
 """
         yaml_str += yaml.dump(settings, default_flow_style=False, sort_keys=False)
