@@ -3,7 +3,8 @@
 
 view:
   method: percentile
-  p_lo: 14
+  p_lo: 30
   p_hi: 100
-  gamma: 1.5
+  gamma: 1.3
   clahe: false
+  roi_center_fraction: 0.9
