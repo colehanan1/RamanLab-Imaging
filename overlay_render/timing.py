@@ -293,14 +293,33 @@ def _parse_ramanlab_timestamps_csv(
     Parse RamanLab timestamps.csv format.
 
     This format has:
-    - event: "FRAME_0", "FRAME_1", ..., "TRIAL_START", "ODOR_CMD", "ESP_RX", etc.
+    - event: "FRAME_0", "FRAME_1", ..., "TRIAL_START", "ODOR_CMD", "ESP_RX", "PHASE_START", etc.
     - phase: "BASELINE", "ODOR", "POST-ODOR", "PROTOCOL", "HOST", "ESP32"
     - frame: frame number (int)
     - odor: odor code like "OFM_H"
 
-    Odor is ON when phase == "ODOR" for frame rows.
+    Two formats are supported:
+    1. FRAME rows have phase column filled in (phase == "ODOR" means odor ON)
+    2. FRAME rows have empty phase column, phase info comes from PHASE_START events
     """
     warnings = []
+
+    # First pass: build phase timeline from PHASE_START events
+    # This maps frame numbers to phase names
+    phase_starts = []  # List of (frame, phase_name)
+    for row in rows:
+        event = row.get("event", "")
+        if event == "PHASE_START":
+            try:
+                frame = int(row.get("frame", 0))
+                phase_name = row.get("phase", "").upper()
+                if phase_name:
+                    phase_starts.append((frame, phase_name))
+            except (ValueError, TypeError):
+                continue
+
+    # Sort by frame number
+    phase_starts.sort(key=lambda x: x[0])
 
     # Filter to only FRAME_* rows
     frame_rows = []
@@ -327,18 +346,51 @@ def _parse_ramanlab_timestamps_csv(
             )
             # Don't return None - still try to use it
 
-    # Get odor name from first row
+    # Get odor name from first row (or from ODOR_CMD events)
     odor_name = frame_rows[0].get("odor") if frame_rows else None
+    if not odor_name:
+        # Try to find odor name from ODOR_CMD event
+        for row in rows:
+            if row.get("event") == "ODOR_CMD":
+                odor_name = row.get("odor")
+                if odor_name:
+                    break
 
-    # Parse odor states based on 'phase' column
+    # Helper function to look up phase for a given frame using PHASE_START timeline
+    def get_phase_from_timeline(frame_idx: int) -> str:
+        """Get phase name for a frame based on PHASE_START events."""
+        current_phase = ""
+        for start_frame, phase_name in phase_starts:
+            if frame_idx >= start_frame:
+                current_phase = phase_name
+            else:
+                break
+        return current_phase
+
+    # Parse odor states based on 'phase' column or PHASE_START timeline
     odor_states = []
+    use_phase_timeline = False
+
+    # Check if FRAME rows have empty phase columns (need to use timeline)
+    if frame_rows and phase_starts:
+        first_few_phases = [row.get("phase", "").strip() for row in frame_rows[:10]]
+        if all(p == "" for p in first_few_phases):
+            use_phase_timeline = True
+            logger.info("FRAME rows have empty phase columns, using PHASE_START timeline")
+
     for row in frame_rows:
         try:
             frame_idx = int(row["frame"])
         except (ValueError, KeyError):
             continue
 
-        phase = row.get("phase", "").upper()
+        if use_phase_timeline:
+            # Look up phase from PHASE_START events
+            phase = get_phase_from_timeline(frame_idx)
+        else:
+            # Use phase column directly
+            phase = row.get("phase", "").upper()
+
         is_on = phase == "ODOR"
         odor_states.append((frame_idx, is_on))
 
@@ -357,6 +409,7 @@ def _parse_ramanlab_timestamps_csv(
     logger.info(
         f"Parsed RamanLab timestamps.csv: {len(frame_rows)} frames, "
         f"{len(intervals)} odor intervals"
+        + (f" (using PHASE_START timeline)" if use_phase_timeline else "")
     )
     return intervals, warnings
 
