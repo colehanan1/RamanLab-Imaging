@@ -167,9 +167,6 @@ class OverlayConfig:
         if self.metadata_json_path is not None and not self.metadata_json_path.exists():
             raise FileNotFoundError(f"Metadata JSON not found: {self.metadata_json_path}")
 
-        # Create output directory if needed
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-
     def validate(self) -> None:
         """Run full validation of configuration."""
         # All validation happens in __post_init__ of sub-configs
