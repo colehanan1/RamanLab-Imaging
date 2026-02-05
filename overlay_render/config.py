@@ -52,6 +52,24 @@ class ViewSettings:
 
 
 @dataclass
+class DenoiseSettings:
+    """Settings for denoising (recording frames only)."""
+    enabled: bool = False
+    method: Literal["none", "nlm", "bilateral", "n2v"] = "none"
+    strength: float = 0.0
+    device: Literal["auto", "cpu", "cuda"] = "auto"
+    model_path: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.method not in ("none", "nlm", "bilateral", "n2v"):
+            raise ValueError(f"denoise.method must be 'none', 'nlm', 'bilateral', or 'n2v', got {self.method}")
+        if self.strength < 0:
+            raise ValueError(f"denoise.strength must be non-negative, got {self.strength}")
+        if self.device not in ("auto", "cpu", "cuda"):
+            raise ValueError(f"denoise.device must be 'auto', 'cpu', or 'cuda', got {self.device}")
+
+
+@dataclass
 class RegistrationSettings:
     """Settings for image registration."""
     enabled: bool = True
@@ -138,6 +156,7 @@ class OverlayConfig:
     metadata_json_path: Optional[Path] = None
     overlay: OverlaySettings = field(default_factory=OverlaySettings)
     view: ViewSettings = field(default_factory=ViewSettings)
+    denoise: DenoiseSettings = field(default_factory=DenoiseSettings)
     registration: RegistrationSettings = field(default_factory=RegistrationSettings)
     annotation: AnnotationSettings = field(default_factory=AnnotationSettings)
     timing: TimingSettings = field(default_factory=TimingSettings)
@@ -288,6 +307,7 @@ def load_config(
         metadata_json_path=data.get("metadata_json_path"),
         overlay=_parse_nested_config(data, "overlay", OverlaySettings),
         view=_parse_nested_config(data, "view", ViewSettings),
+        denoise=_parse_nested_config(data, "denoise", DenoiseSettings),
         registration=_parse_nested_config(data, "registration", RegistrationSettings),
         annotation=_parse_annotation_config(data),
         timing=_parse_nested_config(data, "timing", TimingSettings),

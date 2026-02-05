@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-Micro-Manager + ESP32 Odor Delivery Recorder v9.0
+Micro-Manager + ESP32 Odor Delivery Recorder v10.0
 =================================================
 Systems Neuroscience & Neuromorphic Engineering Lab
 Drosophila Olfactory Behavior Recording System
 
-New in v9.0:
+New in v10.0:
   - RAW frame saving: acquired frames are written as true raw pixel values (uint8/uint16 TIFF) with no contrast/bit-depth scaling.
   - Robust dtype handling: pixel dtype is inferred from the Micro-Manager buffer to avoid accidental uint16 casting of uint8 data.
   - Protocol Runner tab: save/load JSON protocols and run multi-odor, multi-trial sequences with automatic folder structuring.
   - Improved acquisition pacing: frame interval respects both FPS target and exposure time (actual FPS can be exposure-limited).
+  - Protocol replay preview: shows last trial playback between recordings (no live preview during protocol).
 
 Previous fixes (v6.0-6.2 (legacy)):
 - REMOVED auto brightness/contrast from preview & recording
@@ -72,7 +73,7 @@ DEFAULT_SAVE_DIR = str(_user_docs / "Cole" / "Data" / f"Recordings-{_default_dat
 DEFAULT_COM_PORT = "COM3"
 BAUD_RATE = 115200
 ODOR_OPTIONS = ["OFM_A", "OFM_B", "OFM_C", "OFM_H", "OFM_L", "OFM_O", "OFM_E"]
-SOFTWARE_VERSION = '9.0'
+SOFTWARE_VERSION = '10.0'
 
 # Remote server sync settings
 REMOTE_SYNC_ENABLED = False  # Will be configurable in UI
@@ -113,22 +114,31 @@ def safe_slug(s: str, max_len: int = 64) -> str:
         s = "x"
     return s[:max_len]
 
-DEFAULT_FPS = 10
+DEFAULT_FPS = 9
 DEFAULT_EXPOSURE_MS = 100
 DEFAULT_BASELINE = 15
 DEFAULT_ODOR = 4
 DEFAULT_POST = 15
 DEFAULT_ITI = 60
 PREVIEW_FPS = 30  # Target FPS for preview (will be limited by camera/system)
-STATS_EVERY_N_FRAMES = 5  # Only calculate stats every N frames
-MIN_DISK_GB = 5
+STATS_EVERY_N_FRAMES = 10  # Only calculate stats every N frames
+MIN_DISK_GB = 20
 
 # Protocol runner defaults
-DEFAULT_PROTOCOL_NAME = "default_protocol"
+DEFAULT_PROTOCOL_NAME = "full-odor-pannel"
 DEFAULT_PROTOCOL_REPEATS_PER_ODOR = 1
 DEFAULT_PROTOCOL_INTER_ODOR_SEC = 60
 DEFAULT_PROTOCOL_FLY_IDS = ""  # blank = use Fly ID from Run tab
 DEFAULT_SAVE_PROTOCOL_VIDEO = False
+
+# Protocol replay preview (embedded tuned settings; no external file required)
+REPLAY_VIEW_SETTINGS = {
+    "method": "percentile",
+    "p_lo": 40,
+    "p_hi": 100,
+    "gamma": 1.3,
+    "clahe": False,  # CLACHE/CLAHE explicitly disabled for v10
+}
 
 # =============================================================================
 # THEMES
@@ -254,6 +264,8 @@ class TimestampLogger:
         self.log_path = log_path
         self.lock = threading.Lock()
         self.frame_times = []
+        self._buffer = []
+        self._flush_every = 200
         with open(log_path, 'w', newline='') as f:
             csv.writer(f).writerow(['timestamp', 'event', 'phase', 'frame', 'odor',
                                     'duration', 'fly', 'geno', 'interval_ms', 'notes'])
@@ -274,12 +286,25 @@ class TimestampLogger:
 
     def log(self, event, phase="", frame=0, odor="", dur=0, fly="", geno="", interval=0, notes="", ts=None):
         ts_str = self._format_ts(ts)
+        row = [ts_str, event, phase, frame, odor, dur, fly, geno,
+               f"{interval:.2f}" if interval else "", notes]
         with self.lock:
-            with open(self.log_path, 'a', newline='') as f:
-                csv.writer(f).writerow([ts_str, event, phase, frame, odor, dur, fly, geno,
-                                        f"{interval:.2f}" if interval else "", notes])
+            self._buffer.append(row)
             if interval > 0:
                 self.frame_times.append(interval)
+            if (not str(event).startswith("FRAME_")) or len(self._buffer) >= self._flush_every:
+                self._flush_locked()
+
+    def _flush_locked(self):
+        if not self._buffer:
+            return
+        with open(self.log_path, 'a', newline='') as f:
+            csv.writer(f).writerows(self._buffer)
+        self._buffer.clear()
+
+    def flush(self):
+        with self.lock:
+            self._flush_locked()
     
     def get_stats(self):
         if not self.frame_times or not IMAGING_AVAILABLE:
@@ -1125,6 +1150,17 @@ class MicroManagerController:
         except Exception:
             return None, None
 
+    @staticmethod
+    def _extract_elapsed_ms(tags):
+        if not tags:
+            return None
+        for key in ("ElapsedTime-ms", "ElapsedTime_ms", "ElapsedTime", "ElapsedTimeMs"):
+            try:
+                if key in tags:
+                    return float(tags[key])
+            except Exception:
+                continue
+        return None
 
     def acquire_multiphase(self, fps, base_sec, odor_sec, post_sec, save_dir, logger,
                           odor, fly, geno, esp32, prog_cb, phase_cb, save_video=False, frame_cb=None):
@@ -1185,136 +1221,170 @@ class MicroManagerController:
             
             # Get actual exposure time - camera will pace based on this
             exposure_ms = self.core.get_exposure()
-            interval_ms = max(int(round(exposure_ms)), int(round(1000.0 / max(float(fps), 0.001))))
+            acq_interval_ms = max(int(round(exposure_ms)), int(round(1000.0 / max(float(fps), 0.001))))
             # If exposure is longer than the requested frame interval, actual FPS will be limited by exposure.
             
-            phases = [
-                ("BASELINE", b_frames),
-                ("ODOR", o_frames),
-                ("POST-ODOR", p_frames)
-            ]
-            
+            if total <= 0:
+                self.acquisition_running = False
+                return False, "No frames to acquire", {}
+
+            phases = []
+            start = 0
+            for name, count in [("BASELINE", b_frames), ("ODOR", o_frames), ("POST-ODOR", p_frames)]:
+                if count > 0:
+                    phases.append({"name": name, "start": start, "end": start + count})
+                start += count
+
+            odor_frame_start = b_frames if o_frames > 0 else None
+            odor_frame_end = b_frames + o_frames if o_frames > 0 else None
+            metrics["odor_frame_start"] = odor_frame_start
+            metrics["odor_frame_end"] = odor_frame_end
+
             global_frame = 0
-            acq_start_time = time.time()
             last_capture_time = None
-            
-            for phase_idx, (phase_name, phase_frames) in enumerate(phases):
-                if self.abort_flag.is_set():
-                    raise InterruptedError("Aborted")
-                
-                if phase_frames == 0:
-                    continue
-                
+            last_elapsed_ms = None
+            elapsed_times_ms = []
+            use_elapsed = False
+            odor_cmd_sent = False
+
+            def send_odor_now(frame_idx):
+                nonlocal odor_cmd_sent, esp_odor_on_ts
+                if odor_cmd_sent:
+                    return
+                if esp32 and esp32.connected:
+                    try:
+                        esp32.attach_logger(logger)
+                    except Exception:
+                        pass
+
+                    ok_cmd, err = esp32.send_odor(odor, int(round(odor_sec)))
+                    logger.log("ODOR_CMD", "ODOR", frame_idx, odor, odor_sec, fly, geno, 0,
+                               "" if ok_cmd else f"ESP_ERR:{err}")
+
+                    ts_on = None
+                    try:
+                        if hasattr(esp32, "get_last_state_ts"):
+                            ts_on = esp32.get_last_state_ts(odor, "ON")
+                    except Exception:
+                        ts_on = None
+
+                    if ts_on:
+                        esp_odor_on_ts = ts_on
+                        metrics["odor_on_ts_esp"] = ts_on
+                        logger.log("ODOR_ON_TS", "ODOR", frame_idx, odor, odor_sec, fly, geno, 0, ts_on)
+                    else:
+                        ts_host = datetime.now().strftime('%Y-%m-%dT%H:%M:%S.') + f'{datetime.now().microsecond // 1000:03d}'
+                        metrics["odor_on_ts_esp"] = None
+                        logger.log("ODOR_ON_NOESP", "ODOR", frame_idx, odor, odor_sec, fly, geno, 0, ts_host)
+                else:
+                    logger.log("ODOR_CMD_SKIPPED", "ODOR", frame_idx, odor, odor_sec, fly, geno)
+
+                odor_cmd_sent = True
+
+            # === ONE CONTINUOUS SEQUENCE ACQUISITION ===
+            try:
+                self.core.clear_circular_buffer()
+            except Exception:
+                pass
+
+            self.core.start_sequence_acquisition(total, acq_interval_ms, True)
+            acq_start_wall = time.time()
+            last_gui_update = time.time()
+            expected_time = total * (acq_interval_ms / 1000.0)
+
+            phase_idx = 0
+            current_phase = phases[0]["name"] if phases else ""
+            if current_phase:
                 if phase_cb:
-                    phase_cb(phase_name)
-                
-                # Send odor command at start of ODOR phase (and timestamp using ESP32-reported ON/OFF when available)
-                if phase_name == "ODOR":
-                    odor_frame_start = global_frame
-                    odor_frame_end = global_frame + phase_frames
-                    metrics["odor_frame_start"] = odor_frame_start
-                    metrics["odor_frame_end"] = odor_frame_end
+                    phase_cb(current_phase)
+                logger.log("PHASE_START", current_phase, global_frame, odor, odor_sec, fly, geno)
 
-                    if esp32 and esp32.connected:
-                        try:
-                            esp32.attach_logger(logger)
-                        except Exception:
-                            pass
+            if odor_frame_start == 0:
+                send_odor_now(0)
 
-                        ok_cmd, err = esp32.send_odor(odor, int(round(odor_sec)))
-                        logger.log("ODOR_CMD", phase_name, global_frame, odor, odor_sec, fly, geno, 0, "" if ok_cmd else f"ESP_ERR:{err}")
-
-                        # Best-effort: wait briefly for ESP32 to report ON
-                        ok_on, ts_on = (esp32.wait_for_state(odor, "ON", timeout=1.0) if hasattr(esp32, "wait_for_state") else (False, None))
-                        if ok_on and ts_on:
-                            esp_odor_on_ts = ts_on
-                            metrics["odor_on_ts_esp"] = ts_on
-                            logger.log("ODOR_ON_TS", phase_name, global_frame, odor, odor_sec, fly, geno, 0, ts_on)
-                        else:
-                            # Fall back to host-side timing if firmware is silent
-                            ts_host = datetime.now().strftime('%Y-%m-%dT%H:%M:%S.') + f'{datetime.now().microsecond // 1000:03d}'
-                            esp_odor_on_ts = None
-                            metrics["odor_on_ts_esp"] = None
-                            logger.log("ODOR_ON_NOESP", phase_name, global_frame, odor, odor_sec, fly, geno, 0, ts_host)
-                    else:
-                        logger.log("ODOR_CMD_SKIPPED", phase_name, global_frame, odor, odor_sec, fly, geno)
-                
-                logger.log("PHASE_START", phase_name, global_frame, odor, odor_sec, fly, geno)
-                
-                # === SEQUENCE ACQUISITION: Camera handles timing! ===
-                # interval_ms: time between frames (camera's internal clock)
-                # stopOnOverflow=True: stop if buffer overflows
-                self.core.start_sequence_acquisition(phase_frames, interval_ms, True)
-                
-                phase_start = time.time()
-                frames_collected = 0
-                last_gui_update = time.time()
-                
-                # Collect frames - grab in batches for speed
-                while frames_collected < phase_frames:
-                    if self.abort_flag.is_set():
-                        self.core.stop_sequence_acquisition()
-                        raise InterruptedError("Aborted")
-                    
-                    # How many frames available?
-                    available = self.core.get_remaining_image_count()
-                    
-                    if available > 0:
-                        # Batch grab all available frames
-                        batch_count = min(available, phase_frames - frames_collected)
-                        
-                        for _ in range(batch_count):
-                            try:
-                                tagged = self.core.pop_next_tagged_image()
-                                pix = tagged.pix
-                                w, h = tagged.tags['Width'], tagged.tags['Height']
-                                
-                                capture_time = time.time()
-                                raw = self._tagged_to_raw(tagged).copy()
-                                frame_idx = global_frame
-                                interval_ms = (capture_time - last_capture_time) * 1000 if last_capture_time else 0
-                                last_capture_time = capture_time
-
-                                all_frames.append(raw)
-                                all_times.append(capture_time)
-                                frames_collected += 1
-                                global_frame += 1
-                                logger.log(f"FRAME_{frame_idx}", "", frame_idx, odor, odor_sec, fly, geno,
-                                           interval_ms, ts=capture_time)
-                                
-                            except Exception as e:
-                                dropped += 1
-                        
-                        # Update GUI every ~200ms (not per frame!)
-                        now = time.time()
-                        if now - last_gui_update > 0.2:
-                            last_gui_update = now
-                            if prog_cb:
-                                prog_cb(global_frame, total, phase_name)
-                            if frame_cb and len(all_frames) > 0:
-                                display_raw = all_frames[-1]
-                                max_val = (2 ** self.bit_depth) - 1
-                                img8 = (display_raw * (255.0 / max_val)).astype(np.uint8)
-                                frame_cb(Image.fromarray(img8), display_raw)
-                    else:
-                        # No frames yet - tiny sleep
-                        time.sleep(0.002)
-                    
-                    # Timeout: expected_time + 5 seconds buffer
-                    expected_time = phase_frames * (interval_ms / 1000.0)
-                    if time.time() - phase_start > expected_time + 5:
-                        print(f"Phase timeout: got {frames_collected}/{phase_frames}")
-                        break
-                
-                # Stop sequence before next phase
-                try:
+            # Collect frames - grab in batches for speed
+            while global_frame < total:
+                if self.abort_flag.is_set():
                     self.core.stop_sequence_acquisition()
-                    time.sleep(0.02)  # Brief settle time
-                except:
-                    pass
+                    raise InterruptedError("Aborted")
+
+                available = self.core.get_remaining_image_count()
+                if available > 0:
+                    batch_count = min(available, total - global_frame)
+                    for _ in range(batch_count):
+                        try:
+                            tagged = self.core.pop_next_tagged_image()
+                            raw = self._tagged_to_raw(tagged).copy()
+
+                            tags = getattr(tagged, "tags", {}) or {}
+                            elapsed_ms = self._extract_elapsed_ms(tags)
+                            if elapsed_ms is not None:
+                                if not use_elapsed:
+                                    use_elapsed = True
+                                if use_elapsed:
+                                    if last_elapsed_ms is not None:
+                                        frame_interval_ms = max(0.0, float(elapsed_ms) - float(last_elapsed_ms))
+                                    else:
+                                        frame_interval_ms = 0
+                                    last_elapsed_ms = float(elapsed_ms)
+                                    elapsed_times_ms.append(float(elapsed_ms))
+                                    capture_time = acq_start_wall + (float(elapsed_ms) / 1000.0)
+                                else:
+                                    capture_time = time.time()
+                                    frame_interval_ms = (capture_time - last_capture_time) * 1000 if last_capture_time else 0
+                            else:
+                                capture_time = time.time()
+                                frame_interval_ms = (capture_time - last_capture_time) * 1000 if last_capture_time else 0
+
+                            last_capture_time = capture_time
+                            frame_idx = global_frame
+
+                            while phase_idx + 1 < len(phases) and frame_idx >= phases[phase_idx]["end"]:
+                                phase_idx += 1
+                                current_phase = phases[phase_idx]["name"]
+                                if phase_cb:
+                                    phase_cb(current_phase)
+                                logger.log("PHASE_START", current_phase, frame_idx, odor, odor_sec, fly, geno)
+
+                            if (not odor_cmd_sent) and (odor_frame_start is not None) and odor_frame_start > 0:
+                                if frame_idx >= (odor_frame_start - 1):
+                                    send_odor_now(frame_idx)
+
+                            all_frames.append(raw)
+                            all_times.append(capture_time)
+                            global_frame += 1
+                            logger.log(f"FRAME_{frame_idx}", current_phase, frame_idx, odor, odor_sec, fly, geno,
+                                       frame_interval_ms, ts=capture_time)
+                        except Exception:
+                            dropped += 1
+
+                    now = time.time()
+                    if now - last_gui_update > 0.2:
+                        last_gui_update = now
+                        if prog_cb:
+                            prog_cb(global_frame, total, current_phase)
+                        if frame_cb and len(all_frames) > 0:
+                            display_raw = all_frames[-1]
+                            max_val = (2 ** self.bit_depth) - 1
+                            img8 = (display_raw * (255.0 / max_val)).astype(np.uint8)
+                            frame_cb(Image.fromarray(img8), display_raw)
+                else:
+                    time.sleep(0.001)
+
+                if time.time() - acq_start_wall > expected_time + 5:
+                    print(f"Acquisition timeout: got {global_frame}/{total}")
+                    break
+
+            try:
+                self.core.stop_sequence_acquisition()
+            except Exception:
+                pass
             
             # Calculate actual FPS
-            if len(all_times) > 1:
+            if len(elapsed_times_ms) > 1:
+                total_acq_time = (elapsed_times_ms[-1] - elapsed_times_ms[0]) / 1000.0
+                actual_fps = (len(elapsed_times_ms) - 1) / total_acq_time if total_acq_time > 0 else 0
+            elif len(all_times) > 1:
                 total_acq_time = all_times[-1] - all_times[0]
                 actual_fps = (len(all_frames) - 1) / total_acq_time if total_acq_time > 0 else 0
             else:
@@ -1389,6 +1459,10 @@ class MicroManagerController:
 
             all_frames.clear()
             all_times.clear()
+            try:
+                logger.flush()
+            except Exception:
+                pass
 
             return True, f"Acquired {global_frame} frames @ {actual_fps:.1f} FPS (dropped: {dropped})", metrics
             
@@ -1398,12 +1472,20 @@ class MicroManagerController:
                 self.core.stop_sequence_acquisition()
             except:
                 pass
+            try:
+                logger.flush()
+            except Exception:
+                pass
             return False, str(e), {}
         except Exception as e:
             self.acquisition_running = False
             try:
                 self.core.stop_sequence_acquisition()
             except:
+                pass
+            try:
+                logger.flush()
+            except Exception:
                 pass
             return False, str(e), {}
     
@@ -1652,6 +1734,15 @@ class LivePreviewPanel(tk.Frame):
             
         except Exception as e:
             pass  # Silently ignore preview errors
+
+    def clear_image(self):
+        try:
+            self.canvas.delete("all")
+            self.hist_canvas.delete("all")
+            self.stats_label.config(text="Mean: -- | Max: -- | P99: -- | Sat: --%", fg=Theme.BLUE_PALE)
+            self.fps_label.config(text="-- FPS")
+        except Exception:
+            pass
     
     def _update_histogram(self, raw_image):
         try:
@@ -1766,7 +1857,7 @@ class ITITimer:
 class OdorRecorderGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("SNNE Lab - Drosophila Olfactory Recording v9.0")
+        self.root.title("SNNE Lab - Drosophila Olfactory Recording v10.0")
         self.root.state('zoomed')
         self.root.minsize(1200, 700)
         
@@ -1786,6 +1877,9 @@ class OdorRecorderGUI:
         self.protocol_running = False
         self.protocol_abort = threading.Event()
         self.protocol_abort_flag = False
+        self._proto_replay_stop = threading.Event()
+        self._proto_replay_thread = None
+        self._proto_replay_running = False
         
         # Track widgets for theme updates
         self.themed_widgets = []
@@ -1853,7 +1947,7 @@ class OdorRecorderGUI:
             self._proto_space_allowed = False
             self._proto_continue_event = None
 
-    def _protocol_pause_popup(self, seconds, context_text="Next trial"):
+    def _protocol_pause_popup(self, seconds, context_text="Next trial", on_ready=None):
         """Show a modal countdown popup instructing the user to turn OFF shutter, then require SPACE to continue."""
         try:
             seconds = int(round(max(0, float(seconds))))
@@ -1932,6 +2026,11 @@ class OdorRecorderGUI:
                 else:
                     msg.config(text=f"{context_text} is ready. Press SPACE to continue.")
                     countdown.config(text="00 s")
+                    if callable(on_ready):
+                        try:
+                            on_ready()
+                        except Exception:
+                            pass
                     self._proto_space_allowed = True
                     header.config(text="Turn ON shutter and check focus, then press SPACE")
 
@@ -1950,6 +2049,143 @@ class OdorRecorderGUI:
         # Close popup from main thread
         self.root.after(0, self._close_proto_popup)
         return not self.protocol_abort.is_set()
+
+    def _apply_replay_view(self, raw):
+        if raw is None or not IMAGING_AVAILABLE:
+            return None
+        settings = REPLAY_VIEW_SETTINGS
+        try:
+            arr = raw.astype(np.float32)
+        except Exception:
+            return None
+
+        method = str(settings.get("method", "percentile")).lower()
+        if method == "percentile":
+            try:
+                p_lo = float(settings.get("p_lo", 1))
+                p_hi = float(settings.get("p_hi", 99))
+                lo = np.percentile(arr, p_lo)
+                hi = np.percentile(arr, p_hi)
+            except Exception:
+                lo = float(np.min(arr))
+                hi = float(np.max(arr))
+        else:
+            lo = float(np.min(arr))
+            hi = float(np.max(arr))
+
+        if not np.isfinite(lo):
+            lo = 0.0
+        if not np.isfinite(hi) or hi <= lo:
+            hi = lo + 1.0
+
+        arr = (arr - lo) / (hi - lo)
+        arr = np.clip(arr, 0.0, 1.0)
+
+        gamma = settings.get("gamma", 1.0)
+        try:
+            gamma = float(gamma)
+        except Exception:
+            gamma = 1.0
+        if gamma > 0 and gamma != 1.0:
+            arr = np.power(arr, 1.0 / gamma)
+
+        # CLAHE intentionally disabled for v10
+        img8 = (arr * 255.0).clip(0, 255).astype(np.uint8)
+        return Image.fromarray(img8)
+
+    def _find_replay_frames_dir(self, trial_dir):
+        try:
+            trial_dir = Path(trial_dir)
+        except Exception:
+            return None
+        candidates = [
+            trial_dir / "images" / "images",
+            trial_dir / "images",
+            trial_dir,
+        ]
+        for c in candidates:
+            if c.exists():
+                if any(c.glob("frame_*.tif")) or any(c.glob("*.tif")):
+                    return c
+        return None
+
+    def _protocol_replay_loop(self, frames_dir, fps, stop_event):
+        if not IMAGING_AVAILABLE:
+            return
+        try:
+            frames_dir = Path(frames_dir)
+        except Exception:
+            return
+
+        files = sorted(frames_dir.glob("frame_*.tif"))
+        if not files:
+            files = sorted(frames_dir.glob("*.tif"))
+        if not files:
+            return
+
+        try:
+            fps = float(fps) if fps else float(DEFAULT_FPS)
+        except Exception:
+            fps = float(DEFAULT_FPS)
+        fps = max(0.1, fps)
+        delay = 1.0 / fps
+
+        while not stop_event.is_set() and self.protocol_running:
+            for fp in files:
+                if stop_event.is_set() or not self.protocol_running:
+                    break
+                try:
+                    img = Image.open(fp)
+                    raw = np.array(img)
+                    img.close()
+                except Exception:
+                    continue
+
+                disp = self._apply_replay_view(raw)
+                if disp is None:
+                    continue
+                stats = self.mm.get_image_stats(raw) if self.mm else {}
+                if stop_event.is_set() or not self.protocol_running:
+                    break
+                self.root.after(0, lambda d=disp, r=raw, s=stats: self.preview_panel.update_image(d, r, s))
+
+                t0 = time.time()
+                while (time.time() - t0) < delay:
+                    if stop_event.is_set() or not self.protocol_running:
+                        break
+                    time.sleep(0.01)
+
+    def _start_protocol_replay(self, trial_dir, fps):
+        if not IMAGING_AVAILABLE:
+            return
+        frames_dir = self._find_replay_frames_dir(trial_dir)
+        if not frames_dir:
+            return
+        self._stop_protocol_replay(clear=False)
+        stop_event = threading.Event()
+        self._proto_replay_stop = stop_event
+        self._proto_replay_running = True
+        try:
+            self.root.after(0, lambda: self.preview_panel.set_status("Replay (protocol)", Theme.BLUE_ACCENT))
+        except Exception:
+            pass
+        t = threading.Thread(target=self._protocol_replay_loop, args=(frames_dir, fps, stop_event), daemon=True)
+        self._proto_replay_thread = t
+        t.start()
+
+    def _stop_protocol_replay(self, clear=False):
+        try:
+            if self._proto_replay_stop:
+                self._proto_replay_stop.set()
+        except Exception:
+            pass
+        self._proto_replay_running = False
+        if clear:
+            try:
+                self.root.after(0, lambda: self.preview_panel.clear_image())
+                self.root.after(0, lambda: self.preview_panel.set_status("Stopped", Theme.TEXT_MUTED))
+            except Exception:
+                pass
 
     def _toggle_fullscreen(self):
         self.root.state('normal' if self.root.state() == 'zoomed' else 'zoomed')
@@ -2119,7 +2355,7 @@ class OdorRecorderGUI:
         theme_manager.register(self.dark_cb, 'NAVY_DARK', 'TEXT_LIGHT',
                               {'selectcolor': 'NAVY', 'activebackground': 'NAVY_DARK'})
         
-        subtitle = tk.Label(header, text="🪰 v9.0 | Space=Record | Esc=Stop | F5=Repeat",
+        subtitle = tk.Label(header, text="🪰 v10.0 | Space=Next Trial | Esc=Stop | F5=Repeat",
                            font=('Segoe UI', 8), bg=Theme.NAVY_DARK, fg=Theme.BLUE_PALE)
         subtitle.pack(anchor='w')
         theme_manager.register(subtitle, 'NAVY_DARK', 'BLUE_PALE')
@@ -2564,7 +2800,7 @@ class OdorRecorderGUI:
     
 
     # =========================================================================
-    # PROTOCOL RUNNER (v9.0)
+    # PROTOCOL RUNNER (v10.0)
     # =========================================================================
     def _create_protocols_tab(self):
         """Protocols tab: define, save, load, and execute multi-odor runs."""
@@ -2964,6 +3200,17 @@ class OdorRecorderGUI:
 
         self.protocol_abort.clear()
         self.protocol_running = True
+
+        if self.preview_active:
+            self.mm.stop_preview()
+            self.preview_active = False
+            self.preview_btn.config(text="▶ Start Preview")
+            self.preview_panel.set_status("Stopped", Theme.TEXT_MUTED)
+
+        try:
+            self.preview_btn.config(state=tk.DISABLED)
+        except Exception:
+            pass
 
         self.proto_status.config(text="Running protocol…")
         self._log(f"Protocol started: {cfg['name']} | Odors={len(cfg['odors'])} | Repeats={cfg['repeats_per_odor']}", "SUCCESS")
@@ -3388,10 +3635,14 @@ class OdorRecorderGUI:
 
                 # Randomized block schedule: each odor appears once per block (repeat)
                 odor_sequence = build_block_sequence(odors, repeats)
+                last_trial_dir = None
 
                 for t_idx, odor in enumerate(odor_sequence, start=1):
                     if self.protocol_abort_flag or self.protocol_abort.is_set():
                         raise RuntimeError("Protocol aborted.")
+
+                    # Ensure any replay from the previous trial is stopped before recording
+                    self._stop_protocol_replay(clear=True)
 
                     odor_name = ODOR_HUMAN_NAMES.get(odor, odor)
                     trial_dir = fly_dir / f"trial_{t_idx:03d}_{safe_slug(odor)}"
@@ -3469,11 +3720,17 @@ class OdorRecorderGUI:
 
                     # *** IMMEDIATELY turn off shutter after recording completes ***
                     if t_idx < len(odor_sequence):
+                        self._start_protocol_replay(trial_dir, fps)
                         self._update_proto_status(
                             phase_text="⏸️ Recording complete - TURN OFF SHUTTER",
                             timing_text=f"Inter-trial pause: {inter_wait}s countdown"
                         )
-                        self._protocol_pause_popup(inter_wait, context_text="Next trial")
+                        self._protocol_pause_popup(
+                            inter_wait,
+                            context_text="Next trial",
+                            on_ready=lambda: self._stop_protocol_replay(clear=True)
+                        )
+                        self._stop_protocol_replay(clear=True)
 
                     # Trial metadata JSON (one per trial)
                     trial_meta = {
@@ -3542,10 +3799,14 @@ class OdorRecorderGUI:
                         timing_text=f"Saved {metrics.get('frames_captured', '?')} frames",
                         camera_text=f"Success - {metrics.get('fps_measured', '?'):.1f} fps avg" if isinstance(metrics, dict) and metrics.get('fps_measured') else "Success"
                     )
+                    last_trial_dir = trial_dir
 
                 # Optional: between flies, force a short pause for re-focus
                 if fly != fly_ids[-1]:
-                    self._protocol_pause_popup(0, context_text="Next fly")
+                    if last_trial_dir is not None:
+                        self._start_protocol_replay(last_trial_dir, fps)
+                    self._protocol_pause_popup(0, context_text="Next fly", on_ready=lambda: self._stop_protocol_replay(clear=True))
+                    self._stop_protocol_replay(clear=True)
 
             # Write protocol_summary.csv (one row per trial)
             try:
@@ -3587,6 +3848,7 @@ class OdorRecorderGUI:
         finally:
             self.protocol_running = False
             self.protocol_abort_flag = False
+            self._stop_protocol_replay(clear=True)
             # Reset UI state on main thread
             def _reset_ui():
                 try:
@@ -3594,6 +3856,7 @@ class OdorRecorderGUI:
                     self.run_proto_btn.config(state=tk.NORMAL)
                     self.save_proto_btn.config(state=tk.NORMAL)
                     self.load_proto_file_btn.config(state=tk.NORMAL)
+                    self.preview_btn.config(state=tk.NORMAL)
                     # Clear status after a delay
                     self.root.after(5000, self._clear_proto_status)
                 except Exception:
@@ -4006,6 +4269,9 @@ class OdorRecorderGUI:
         if not self.mm or not self.mm.connected:
             messagebox.showwarning("Not Connected", "Connect to camera first")
             return
+        if self.protocol_running:
+            self._log("Preview disabled during protocol (replay shown between trials).", "WARNING")
+            return
         
         if self.preview_active:
             self.mm.stop_preview()
@@ -4253,6 +4519,7 @@ class OdorRecorderGUI:
             self.protocol_running = False
         except Exception:
             pass
+        self._stop_protocol_replay(clear=True)
         if self.mm:
             self.mm.abort()
         if self.esp32.connected:
@@ -4305,12 +4572,12 @@ class OdorRecorderGUI:
 # =============================================================================
 def main():
     print("=" * 60)
-    print("SNNE Lab - Drosophila Olfactory Recording v9.0")
+    print("SNNE Lab - Drosophila Olfactory Recording v10.0")
     print("=" * 60)
-    print("\nNew in v9.0:")
-    print("  - FAST RECORDING: Camera handles timing (not Python)")
-    print("  - Batch frame retrieval for maximum FPS")
-    print("  - Should achieve ~10 FPS at 100ms exposure")
+    print("\nNew in v10.0:")
+    print("  - Continuous acquisition across phases (no gaps)")
+    print("  - Protocol replay preview between trials")
+    print("  - Default 9 FPS at 100ms exposure")
     print("\nShortcuts: Space=Next Trial (protocol) | Escape=Stop | F5=Repeat | F11=Fullscreen\n")
     
     root = tk.Tk()

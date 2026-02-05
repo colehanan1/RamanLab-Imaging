@@ -25,6 +25,7 @@ import numpy as np
 from .config import OverlayConfig, load_config
 from .loaders import load_structure, load_recording
 from .registration import FrameRegistration
+from .denoise import apply_denoise
 from .view_scaling import compute_global_scaling_params, scale_frame
 from .timing import extract_odor_timing
 from .annotation import draw_odor_annotation
@@ -395,8 +396,14 @@ def run_pipeline(config: OverlayConfig, save_thumbnail_flag: bool = True, record
             else:
                 registered_frame = raw_frame
 
+            # Apply denoising to recording frame (before view scaling)
+            if config.denoise.enabled:
+                denoised_frame = apply_denoise(registered_frame, config.denoise)
+            else:
+                denoised_frame = registered_frame
+
             # Apply view scaling
-            scaled_frame = scale_frame(registered_frame, scaling_params)
+            scaled_frame = scale_frame(denoised_frame, scaling_params)
 
             # Create output frame
             if recording_only:

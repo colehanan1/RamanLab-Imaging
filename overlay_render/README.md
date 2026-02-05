@@ -1,15 +1,100 @@
 # overlay_render
 
-A robust, view-only visualization pipeline for neuroscience imaging data. Creates overlay videos of calcium imaging recordings over structural reference images with odor/stimulus annotation.
+**A visualization pipeline for calcium imaging neuroscience data.**
+
+Overlay_render creates annotated videos by overlaying calcium imaging recordings (GCaMP fluorescence) over structural reference images (RFP). It automatically aligns frames, annotates odor stimulus timing, and produces publication-ready videos with optional denoising.
+
+**What this pipeline does:**
+- 🎥 Creates overlay videos: recording frames + structure image + odor annotations
+- 🔄 Automatic frame-by-frame registration (rigid or affine alignment)
+- 📊 View scaling: percentile/minmax contrast, gamma correction, optional CLAHE
+- 🧪 Odor annotation: "ODOR ON" text boxes during stimulus delivery
+- 🖼️ Optional denoising: Classical (NLM, bilateral) or deep learning (Noise2Void)
+- 📝 Comprehensive JSON reports with processing parameters and metrics
+
+**What this pipeline does NOT do:**
+- ❌ Signal extraction (ΔF/F, ROI analysis, etc.) - use other tools
+- ❌ Spike detection or neural activity analysis
+- ❌ Statistical analysis or comparisons
+
+This is a **view-only presentation pipeline** for creating videos and thumbnails.
+
+---
+
+## Quick Start
+
+### Installation
+
+```bash
+# From repository root
+cd /path/to/RamanLab-Imaging/RamanLab-Imaging
+
+# Install core dependencies
+pip install numpy opencv-python imageio imageio-ffmpeg tifffile pyyaml pytest
+
+# Optional: Install denoising dependencies (for Noise2Void deep learning)
+pip install torch torchvision tqdm
+```
+
+### Basic Usage
+
+```bash
+# Process a single trial with auto-discovery (easiest)
+python -m overlay_render --folder /path/to/Trial_001_OFM_E_123456/
+
+# Process entire experiment folder (all trials)
+python -m overlay_render --folder /path/to/experiment_folder/
+
+# Recording-only mode (no structure overlay)
+python -m overlay_render --folder /path/to/trial/ --recording-only
+
+# With denoising (fast classical method)
+python -m overlay_render --folder /path/to/trial/ \
+  --denoise.enabled true \
+  --denoise.method bilateral \
+  --denoise.strength 5
+
+# Interactive preview GUI (tune parameters, then save settings)
+python -m overlay_render.preview --folder /path/to/trial/
+```
+
+### Typical Workflow
+
+```bash
+# 1. Preview and tune parameters interactively
+python -m overlay_render.preview --folder trial_folder/
+# → Adjust gamma, contrast, CLAHE, etc. in GUI
+# → Press 's' to save tuned_settings.yaml
+
+# 2. Render final video with tuned settings
+python -m overlay_render --folder trial_folder/ \
+  --settings tuned_settings.yaml
+
+# 3. Output files created:
+# trial_folder_overlay.mp4
+# trial_folder_report.json  
+# trial_folder_thumbnail.png
+```
+
+---
 
 ## Features
 
-- **View-only processing**: Brightness/contrast adjustments for visualization (no analysis operations)
-- **Multiple input formats**: TIFF stacks, MP4/AVI videos, PNG structure images
-- **Automatic registration**: Rigid (Euclidean) or affine alignment of recording to structure
-- **Odor annotation**: "ODOR ON" text overlay during stimulus delivery frames
-- **Flexible timing**: Parse odor timing from CSV per-frame data or JSON intervals
-- **Comprehensive reports**: JSON reports with parameters, hashes, and processing metrics
+### Core Features
+- ✅ **View-only processing**: Brightness/contrast adjustments for visualization (no analysis)
+- ✅ **Multiple input formats**: TIFF stacks, MP4/AVI videos, PNG structure images
+- ✅ **Automatic registration**: Rigid (Euclidean) or affine alignment using OpenCV ECC
+- ✅ **Odor annotation**: "ODOR ON" text overlay during stimulus delivery frames
+- ✅ **Flexible timing**: Parse odor timing from CSV per-frame data or JSON intervals
+- ✅ **Comprehensive reports**: JSON reports with parameters, hashes, and processing metrics
+
+### Optional Denoising (New!)
+- 🔹 **Classical methods**: Fast CPU-based (bilateral filter ~2ms/frame, NLM ~32ms/frame)
+- 🔹 **Deep learning**: Noise2Void self-supervised training + GPU inference
+- 🔹 **Recording-only**: Denoising applied only to recording frames, never structure
+- 🔹 **Flexible config**: Enable/disable, choose method, tune strength via YAML or CLI
+
+---
 
 ## Installation
 
@@ -18,15 +103,16 @@ A robust, view-only visualization pipeline for neuroscience imaging data. Create
 python -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
 
-# Install dependencies
-pip install numpy opencv-python imageio imageio-ffmpeg tifffile pyyaml
+# Install core dependencies
+pip install numpy opencv-python imageio imageio-ffmpeg tifffile pyyaml pytest
 
-# For running tests
-pip install pytest
+# Optional: Install denoising dependencies (Noise2Void deep learning)
+pip install torch torchvision tqdm
 ```
 
 ### Dependencies
 
+**Core (required):**
 | Package | Purpose |
 |---------|---------|
 | numpy | Array operations |
@@ -35,10 +121,82 @@ pip install pytest
 | imageio-ffmpeg | FFmpeg backend for MP4 |
 | tifffile | TIFF stack reading |
 | pyyaml | Configuration parsing |
+| pytest | Running tests |
 
-## Quick Start
+**Optional (for N2V denoising):**
+| Package | Purpose |
+|---------|---------|
+| torch | PyTorch for deep learning inference |
+| torchvision | Image transforms |
+| tqdm | Progress bars for training |
 
-### 1. Create a configuration file
+---
+
+## Command-Line Interface
+
+### Main Pipeline
+
+```bash
+# Process a single trial folder
+python -m overlay_render --folder /path/to/Trial_001_OFM_E_123456/
+
+# Process entire experiment (all trials)
+python -m overlay_render --folder /path/to/experiment_folder/
+
+# Use custom config file
+python -m overlay_render --config my_config.yaml
+
+# Recording-only (no structure overlay)
+python -m overlay_render --folder /path/to/trial/ --recording-only
+
+# Filter specific odor types
+python -m overlay_render --folder /path/to/experiment/ --filter OFM_E
+
+# Override config parameters via CLI
+python -m overlay_render --folder /path/to/trial/ \
+  --view.gamma 1.5 \
+  --overlay.alpha 0.7 \
+  --annotation.font_scale 1.2
+```
+
+### Preview GUI
+
+```bash
+# Launch interactive preview
+python -m overlay_render.preview --folder /path/to/trial/
+
+# Preview with saved settings
+python -m overlay_render.preview --folder /path/to/trial/ \
+  --settings tuned_settings.yaml
+
+# Recording-only preview
+python -m overlay_render.preview --folder /path/to/trial/ --recording-only
+```
+
+**Preview Keyboard Controls:**
+- `Space` - Play/pause
+- `→/←` - Next/previous frame
+- `s` - Save current settings to `tuned_settings.yaml`
+- `r` - Toggle registration on/off
+- `q` - Quit
+
+### Output Files
+
+Running the pipeline creates three files per trial:
+
+```
+Trial_001_OFM_E_123456_overlay.mp4       # Annotated video
+Trial_001_OFM_E_123456_report.json       # Processing parameters and metrics
+Trial_001_OFM_E_123456_thumbnail.png     # Representative frame thumbnail
+```
+
+---
+
+## Configuration
+
+### Example Configuration File
+
+Create a YAML file with your experiment parameters:
 
 ```yaml
 # my_config.yaml
@@ -55,40 +213,18 @@ timing:
   fps: 30.0
 ```
 
-### 2. Run the pipeline
-
+Then run:
 ```bash
 python -m overlay_render --config my_config.yaml
 ```
 
-### 3. Check outputs
-
-- `<recording_stem>_overlay.mp4` - Rendered overlay video
-- `<recording_stem>_report.json` - Processing report
-- `<recording_stem>_thumbnail.png` - Representative frame
-
-## Usage
-
-### Basic Command
-
+**OR use folder auto-discovery mode (recommended):**
 ```bash
-python -m overlay_render --config path/to/config.yaml
+python -m overlay_render --folder /path/to/trial_folder/
+# Auto-discovers structure, recording, and metadata files
 ```
 
-### CLI Options
-
-```bash
-python -m overlay_render --help
-
-# Verbose output
-python -m overlay_render --config config.yaml -v
-
-# Dry run (validate config only)
-python -m overlay_render --config config.yaml --dry-run
-
-# Override config values
-python -m overlay_render --config config.yaml --view.gamma 1.5 --overlay.alpha 0.7
-```
+### Configuration Sections
 
 ## Configuration Reference
 
@@ -129,6 +265,34 @@ view:
   p_hi: 99              # Upper percentile
   gamma: 1.0            # Gamma correction (1.0 = linear)
   clahe: false          # Enable CLAHE
+```
+
+### Denoise (Optional)
+
+Denoising is applied to recording frames only, **before** view scaling/gamma/CLAHE.
+
+```yaml
+denoise:
+  enabled: false        # Enable denoising (default: false)
+  method: "none"        # "none", "nlm", "bilateral", "n2v"
+  strength: 0           # Method-dependent strength parameter (ignored for n2v)
+  device: "auto"        # "auto", "cpu", or "cuda" (for n2v)
+  model_path: null      # Path to N2V model directory (required for method: n2v)
+```
+
+**Methods:**
+- `none`: Disabled (default)
+- `nlm`: Non-local means (CPU, ~32ms/frame, edge-preserving)
+- `bilateral`: Bilateral filter (CPU, ~2ms/frame, fast edge-preserving)
+- `n2v`: Noise2Void deep learning (GPU/CPU, requires trained model)
+
+**CLI Override Examples:**
+```bash
+# Classical denoising (fast, no training needed)
+--denoise.enabled true --denoise.method bilateral --denoise.strength 5
+
+# N2V deep learning denoising (requires trained model)
+--denoise.enabled true --denoise.method n2v --denoise.model_path models/my_model --denoise.device cuda
 ```
 
 ### Registration
@@ -324,6 +488,42 @@ The default output uses `yuv420p` pixel format for compatibility. If colors look
 1. Try a different video player (VLC recommended)
 2. Check if your system has FFmpeg installed correctly
 
+---
+
+## Testing
+
+Run the test suite to verify installation:
+
+```bash
+# From repository root
+cd /path/to/RamanLab-Imaging/RamanLab-Imaging
+
+# Run all tests
+pytest overlay_render/tests/ -v
+
+# Run specific test file
+pytest overlay_render/tests/test_smoke.py -v
+
+# Quick test (quiet mode)
+pytest overlay_render/tests/ -q
+
+# With coverage report
+pytest overlay_render/tests/ -v --cov=overlay_render
+```
+
+**Test coverage:** 42 comprehensive tests including:
+- 11 original pipeline tests (loading, registration, rendering)
+- 3 edge case tests (missing files, invalid parameters)
+- 8 denoise configuration tests
+- 11 classical denoising implementation tests
+- 4 N2V training tests (skipped if PyTorch not installed)
+- 5 N2V inference tests (skipped if PyTorch not installed)
+- 1 full pipeline integration test with N2V
+
+All tests use synthetic data and are deterministic (no external file dependencies).
+
+---
+
 ## License
 
 MIT License - See LICENSE file for details.
@@ -338,3 +538,137 @@ MIT License - See LICENSE file for details.
 ## Acknowledgments
 
 Built for the Raman Lab neuroscience imaging workflow.
+
+## Noise2Void Training (Optional)
+
+Train a self-supervised deep learning denoiser without requiring clean/paired data.
+
+### Installation
+
+```bash
+# Install N2V dependencies (PyTorch + CUDA)
+pip install -e .[n2v]
+
+# This installs: torch>=2.0.0, torchvision>=0.15.0, tqdm>=4.60.0
+```
+
+### Training a Model
+
+```bash
+# Train on a TIFF stack
+python -m overlay_render.train_n2v \
+    --input recording.tif \
+    --output_model_dir models/n2v_trial1 \
+    --epochs 50 \
+    --device cuda
+
+# Train on a recording folder
+python -m overlay_render.train_n2v \
+    --input /path/to/trial_folder \
+    --output_model_dir models/n2v_trial1 \
+    --epochs 50 \
+    --device cuda
+```
+
+### Training Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--input` | Required | Input TIFF stack or recording folder |
+| `--output_model_dir` | Required | Output directory for model and logs |
+| `--epochs` | 50 | Number of training epochs |
+| `--batch_size` | 16 | Batch size for training |
+| `--steps_per_epoch` | 200 | Number of batches per epoch |
+| `--patch_size` | 64 | Training patch size (must be divisible by 16) |
+| `--learning_rate` | 0.0004 | Learning rate |
+| `--device` | auto | Device: auto, cpu, or cuda |
+| `--seed` | 42 | Random seed |
+
+### Expected Runtime
+
+Hardware: NVIDIA 4080 GPU, 340-frame recording (256×256 pixels)
+
+- **50 epochs**: ~10-15 minutes
+- **100 epochs**: ~20-30 minutes
+
+CPU training is significantly slower (~10x) and not recommended for production.
+
+### Outputs
+
+Training produces:
+
+```
+models/n2v_trial1/
+├── model_best.pth       # Best model checkpoint
+├── model_latest.pth     # Latest model checkpoint
+├── config.json          # Training configuration
+└── training_log.txt     # Loss history and training log
+```
+
+### Using Trained Model
+
+After training, use the model for denoising in your rendering pipeline:
+
+**In config YAML:**
+```yaml
+denoise:
+  enabled: true
+  method: "n2v"
+  model_path: "models/n2v_trial1"  # Can be directory or .pth file
+  device: "cuda"  # "auto", "cpu", or "cuda"
+```
+
+**Via CLI:**
+```bash
+# Apply N2V denoising during render
+python -m overlay_render --folder trial_folder/ \
+    --recording-only \
+    --denoise.enabled true \
+    --denoise.method n2v \
+    --denoise.model_path models/n2v_trial1 \
+    --denoise.device cuda
+
+# Use in preview mode
+python -m overlay_render --preview --folder trial_folder/ \
+    --recording-only \
+    --denoise.enabled true \
+    --denoise.method n2v \
+    --denoise.model_path models/n2v_trial1
+```
+
+**Notes:**
+- Model is loaded once and cached for all frames (efficient)
+- Inference uses same normalization as training (percentile-based)
+- GPU inference is ~10-50x faster than CPU depending on frame size
+- Model path can be directory (loads `model_best.pth`) or direct `.pth` file
+
+**Note**: N2V inference is not yet implemented. The training utility prepares the model artifact for future use.
+
+### Training Tips
+
+1. **Data Requirements**: Minimum 50-100 frames recommended. More frames = better denoising.
+
+2. **Patch Size**: 64x64 works well for most calcium imaging data. Use 128x128 for larger FOV.
+
+3. **Epochs**: Start with 50 epochs. Monitor loss - if still decreasing, train longer.
+
+4. **Device**: Always use CUDA for practical training times. CPU training is for testing only.
+
+5. **Validation**: After training, test on held-out frames to ensure no overfitting.
+
+### Troubleshooting
+
+**Out of Memory (CUDA)**:
+- Reduce `--batch_size` (e.g., 8 or 4)
+- Reduce `--patch_size` (e.g., 48)
+
+**Slow Training (GPU not utilized)**:
+- Check `device: cuda` in log
+- Verify CUDA is available: `python -c "import torch; print(torch.cuda.is_available())"`
+- Update PyTorch/CUDA drivers
+
+**Loss not decreasing**:
+- Train longer (100+ epochs)
+- Check data quality (sufficient frames, good SNR)
+- Try different `--learning_rate` (e.g., 0.0002 or 0.0008)
+

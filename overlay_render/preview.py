@@ -24,6 +24,9 @@ from typing import Optional, Tuple
 import cv2
 import numpy as np
 
+from .denoise import apply_denoise
+from .config import DenoiseSettings
+
 logger = logging.getLogger(__name__)
 
 
@@ -307,6 +310,13 @@ class PreviewGUI:
         if not self.recording_only and self.use_registration:
             frame = self._apply_registration(frame)
 
+        # Apply denoising (placeholder - denoise not yet in preview GUI controls)
+        # When denoise controls are added to GUI, apply here before scaling
+        # For now, denoise is disabled in preview (no trackbars yet)
+        denoise_settings = DenoiseSettings(enabled=False)
+        if denoise_settings.enabled:
+            frame = apply_denoise(frame, denoise_settings)
+
         # Scale images
         gamma_val = self.gamma / 10.0
         alpha_val = self.alpha / 100.0
@@ -369,6 +379,10 @@ class PreviewGUI:
         if roi_fraction < 1.0:
             settings["view"]["roi_center_fraction"] = roi_fraction
 
+        # Include denoise settings only if non-default (placeholder for future GUI controls)
+        # Currently denoise is not exposed in preview GUI, so always disabled
+        # When denoise controls are added, include here if enabled
+        
         return settings
 
     def save_settings(self, path: Path):

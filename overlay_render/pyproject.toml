@@ -40,6 +40,11 @@ dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
 ]
+n2v = [
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "tqdm>=4.60.0",
+]
 
 [project.scripts]
 overlay-render = "overlay_render.cli:main"

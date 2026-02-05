@@ -76,6 +76,36 @@ view:
   clahe_tile_grid: [8, 8]
 
 # =============================================================================
+# DENOISE SETTINGS (Recording frames only - NO-OP until enabled)
+# =============================================================================
+# Optional denoising applied to recording frames before view scaling.
+# NOTE: This is configuration plumbing only - denoising implementation TBD.
+
+# denoise:
+#   # Enable/disable denoising (default: false, no-op)
+#   enabled: false
+#
+#   # Denoising method (no effect until implementation):
+#   #   - "none": No denoising (default)
+#   #   - "nlm": Non-local means (classic algorithm, CPU/GPU)
+#   #   - "bilateral": Bilateral filter (edge-preserving)
+#   #   - "n2v": Noise2Void deep learning (requires model_path)
+#   method: "none"
+#
+#   # Strength parameter (interpretation depends on method)
+#   # Typical range: 0-10 for nlm/bilateral, 0-1 for n2v
+#   strength: 0
+#
+#   # Device preference:
+#   #   - "auto": Use GPU if available, fallback to CPU
+#   #   - "cpu": Force CPU
+#   #   - "cuda": Force CUDA GPU (error if not available)
+#   device: "auto"
+#
+#   # Model path for n2v method (required if method="n2v")
+#   model_path: null  # "/path/to/n2v_model.pth"
+
+# =============================================================================
 # REGISTRATION SETTINGS
 # =============================================================================
 # Aligns recording frames to the structure image
