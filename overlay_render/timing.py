@@ -9,10 +9,13 @@ Priority:
 3. JSON times + fps -> frame indices (validated)
 """
 
+import bisect
 import csv
 import json
 import logging
+import re
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
@@ -285,6 +288,186 @@ def _try_parse_csv(
     return intervals, warnings
 
 
+def _parse_timestamp(ts_str: str) -> Optional[datetime]:
+    """Parse a CSV timestamp string into a datetime object.
+
+    Supports format ``2026-02-10T16:20:33.519`` (millisecond precision).
+    """
+    try:
+        ts_str = ts_str.strip()
+        if "." in ts_str:
+            return datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%S.%f")
+        return datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%S")
+    except (ValueError, AttributeError):
+        return None
+
+
+def _find_nearest_frame(
+    frame_times: List[Tuple[int, datetime]],
+    target: datetime,
+) -> int:
+    """Return the frame index whose timestamp is closest to *target*.
+
+    ``frame_times`` must be sorted by datetime (ascending).
+    Uses binary search for efficiency.
+    """
+    if not frame_times:
+        return 0
+
+    # Extract just the datetime values for bisect
+    times = [ft[1] for ft in frame_times]
+    pos = bisect.bisect_left(times, target)
+
+    # Edge cases
+    if pos == 0:
+        return frame_times[0][0]
+    if pos >= len(frame_times):
+        return frame_times[-1][0]
+
+    # Compare the two candidates that bracket the target
+    before_idx, before_t = frame_times[pos - 1]
+    after_idx, after_t = frame_times[pos]
+
+    if (target - before_t) <= (after_t - target):
+        return before_idx
+    return after_idx
+
+
+def _try_timestamp_based_odor(
+    rows: List[dict],
+    n_frames: int,
+) -> Optional[Tuple[List[OdorInterval], List[str]]]:
+    """Try to determine odor ON/OFF by matching event timestamps to frame timestamps.
+
+    Looks for ODOR_CMD_SENT / ODOR_ON_ESP / ODOR_ON_NOESP events and maps
+    their wall-clock times to the nearest captured frame.
+
+    Returns ``None`` if the required events are not present so that the
+    caller can fall back to the phase-based approach.
+    """
+    warnings: List[str] = []
+
+    # 1. Build (frame_idx, datetime) list from FRAME_* rows ──────────────
+    frame_times: List[Tuple[int, datetime]] = []
+    for row in rows:
+        event = row.get("event", "")
+        if not event.startswith("FRAME_"):
+            continue
+        ts = _parse_timestamp(row.get("timestamp", ""))
+        if ts is None:
+            continue
+        try:
+            fidx = int(row.get("frame", -1))
+        except (ValueError, TypeError):
+            continue
+        if fidx >= 0:
+            frame_times.append((fidx, ts))
+
+    if not frame_times:
+        return None
+
+    # Ensure sorted by timestamp
+    frame_times.sort(key=lambda x: x[1])
+
+    # 2. Determine odor name ─────────────────────────────────────────────
+    odor_name: Optional[str] = None
+    for row in rows:
+        ev = row.get("event", "")
+        if ev in ("ODOR_CMD_SENT", "ODOR_CMD"):
+            odor = row.get("odor", "")
+            # Skip the carrier pin (OFM_P)
+            if odor and odor.upper() != "OFM_P":
+                odor_name = odor
+                break
+
+    # 3. Find odor ON timestamp (priority: ESP > NOESP > CMD_SENT) ──────
+    on_ts: Optional[datetime] = None
+    odor_duration_s: Optional[float] = None
+
+    # Priority order for ON events
+    on_event_priority = ["ODOR_ON_ESP", "ODOR_ON_TS", "ODOR_ON_NOESP", "ODOR_CMD_SENT"]
+    for target_event in on_event_priority:
+        if on_ts is not None:
+            break
+        for row in rows:
+            if row.get("event", "") != target_event:
+                continue
+            # For ODOR_CMD_SENT, skip the carrier pin
+            row_odor = row.get("odor", "").upper()
+            if target_event == "ODOR_CMD_SENT" and row_odor == "OFM_P":
+                continue
+            on_ts = _parse_timestamp(row.get("timestamp", ""))
+            # Try to get duration from the 'duration' column
+            try:
+                dur = row.get("duration", "")
+                if dur:
+                    odor_duration_s = float(dur)
+            except (ValueError, TypeError):
+                pass
+            # Also check 'notes' field for duration=N
+            if odor_duration_s is None:
+                notes = row.get("notes", "")
+                m = re.search(r"duration=(\d+\.?\d*)", str(notes))
+                if m:
+                    odor_duration_s = float(m.group(1))
+            if on_ts is not None:
+                break
+
+    if on_ts is None:
+        # No odor command events found — fall back to phase-based
+        return None
+
+    # 4. Find odor OFF timestamp ─────────────────────────────────────────
+    off_ts: Optional[datetime] = None
+
+    off_event_priority = ["ODOR_OFF_ESP", "ODOR_OFF_TS"]
+    for target_event in off_event_priority:
+        if off_ts is not None:
+            break
+        for row in rows:
+            if row.get("event", "") != target_event:
+                continue
+            off_ts = _parse_timestamp(row.get("timestamp", ""))
+            if off_ts is not None:
+                break
+
+    # Compute from ON + duration if no explicit OFF event
+    if off_ts is None and odor_duration_s is not None:
+        off_ts = on_ts + timedelta(seconds=odor_duration_s)
+
+    if off_ts is None:
+        warnings.append(
+            "Found odor ON event but no OFF event and no duration; "
+            "falling back to phase-based timing"
+        )
+        return None
+
+    # 5. Map timestamps to nearest frames ────────────────────────────────
+    start_frame = _find_nearest_frame(frame_times, on_ts)
+    end_frame = _find_nearest_frame(frame_times, off_ts)
+
+    # Sanity: end must be >= start
+    if end_frame < start_frame:
+        warnings.append(
+            f"Odor OFF frame ({end_frame}) before ON frame ({start_frame}); "
+            "falling back to phase-based timing"
+        )
+        return None
+
+    interval = OdorInterval(
+        start_frame=start_frame,
+        end_frame=end_frame,
+        odor_name=odor_name,
+    )
+
+    logger.info(
+        "Using timestamp-based odor timing: ON @ frame %d, OFF @ frame %d "
+        "(odor=%s, on_ts=%s, off_ts=%s)",
+        start_frame, end_frame, odor_name, on_ts, off_ts,
+    )
+    return [interval], warnings
+
+
 def _parse_ramanlab_timestamps_csv(
     rows: List[dict],
     n_frames: int
@@ -304,6 +487,17 @@ def _parse_ramanlab_timestamps_csv(
     """
     warnings = []
 
+    # ── Timestamp-based odor detection (preferred) ──────────────────────
+    # When ODOR_CMD_SENT / ODOR_ON_* events exist we can map the actual
+    # odor command wall-clock time to the nearest captured frame, which is
+    # more accurate than the phase-count approach.
+    ts_result = _try_timestamp_based_odor(rows, n_frames)
+    if ts_result is not None:
+        intervals, ts_warnings = ts_result
+        warnings.extend(ts_warnings)
+        return intervals, warnings
+
+    # ── Fallback: phase-based detection ─────────────────────────────────
     # First pass: build phase timeline from PHASE_START events
     # This maps frame numbers to phase names
     phase_starts = []  # List of (frame, phase_name)

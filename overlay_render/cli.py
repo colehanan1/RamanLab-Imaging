@@ -25,12 +25,13 @@ import numpy as np
 from .config import OverlayConfig, load_config
 from .loaders import load_structure, load_recording
 from .registration import FrameRegistration
+from .bleach import precompute_bleach_corrector, format_preproc_banner
 from .denoise import apply_denoise
 from .view_scaling import compute_global_scaling_params, scale_frame
 from .timing import extract_odor_timing
 from .annotation import draw_odor_annotation
 from .overlay import OverlayRenderer
-from .writer import VideoWriter, save_thumbnail
+from .writer import VideoWriter, save_thumbnail, save_tiff_frame
 from .report import generate_report, save_report, format_report_summary
 from .utils import setup_logging, get_representative_frame_index
 
@@ -163,6 +164,17 @@ Examples:
         default=None,
         help="Start preview at this frame index (useful for finding bright frames)"
     )
+    parser.add_argument(
+        "--save-tiff",
+        action="store_true",
+        help="Save processed frames as TIFF files alongside video"
+    )
+    parser.add_argument(
+        "--tiff-format",
+        choices=["uint8", "float32"],
+        default="uint8",
+        help="TIFF bit depth: uint8 (smaller files) or float32 (preserves dynamic range)"
+    )
 
     # Parse known args to allow for override args
     args, unknown = parser.parse_known_args(argv)
@@ -246,7 +258,7 @@ def _resolve_output_dir(
     return output_dir
 
 
-def run_pipeline(config: OverlayConfig, save_thumbnail_flag: bool = True, recording_only: bool = False) -> dict:
+def run_pipeline(config: OverlayConfig, save_thumbnail_flag: bool = True, recording_only: bool = False, save_tiff: bool = False, tiff_format: str = "uint8") -> dict:
     """
     Run the full overlay rendering pipeline.
 
@@ -254,6 +266,8 @@ def run_pipeline(config: OverlayConfig, save_thumbnail_flag: bool = True, record
         config: Validated configuration.
         save_thumbnail_flag: Whether to save thumbnail image.
         recording_only: If True, render only the recording (grayscale, no overlay).
+        save_tiff: If True, save processed frames as TIFF files.
+        tiff_format: TIFF bit depth: "uint8" or "float32".
 
     Returns:
         Report dictionary.
@@ -282,6 +296,22 @@ def run_pipeline(config: OverlayConfig, save_thumbnail_flag: bool = True, record
     logger.info("=" * 60)
     recording = load_recording(config.recording_path)
     logger.info(f"Recording: {recording.n_frames} frames, shape: {recording.frame_shape}")
+
+    # Step 2b: Precompute bleach correction (if enabled)
+    bleach_corrector = None
+    if config.bleach_correction.enabled and config.bleach_correction.method != "none":
+        logger.info("Computing bleach correction trend from recording...")
+        bleach_corrector = precompute_bleach_corrector(
+            settings=config.bleach_correction,
+            recording_iterator=recording,
+            n_frames=recording.n_frames,
+        )
+
+    # Log preprocessing banner
+    banner = format_preproc_banner(
+        config.bleach_correction, config.denoise, config.view
+    )
+    logger.info(banner)
 
     # Determine FPS
     fps = config.timing.fps
@@ -372,10 +402,18 @@ def run_pipeline(config: OverlayConfig, save_thumbnail_flag: bool = True, record
     if recording_only:
         output_video = config.output_dir / f"{stem}_recording.mp4"
         output_thumbnail = config.output_dir / f"{stem}_recording_thumbnail.png"
+        output_tiff_dir = config.output_dir / f"{stem}_recording_tiff" if save_tiff else None
     else:
         output_video = config.output_dir / f"{stem}_overlay.mp4"
         output_thumbnail = config.output_dir / f"{stem}_thumbnail.png"
+        output_tiff_dir = config.output_dir / f"{stem}_overlay_tiff" if save_tiff else None
     output_report = config.output_dir / f"{stem}_report.json"
+
+    # Create TIFF output directory if needed
+    if save_tiff:
+        output_tiff_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"TIFF output directory: {output_tiff_dir}")
+        logger.info(f"TIFF format: {tiff_format}")
 
     thumbnail_frame = None
     thumbnail_idx = recording.n_frames // 2
@@ -396,11 +434,19 @@ def run_pipeline(config: OverlayConfig, save_thumbnail_flag: bool = True, record
             else:
                 registered_frame = raw_frame
 
+            # Apply bleach correction (before denoise, before view scaling)
+            if bleach_corrector is not None:
+                corrected_frame = bleach_corrector.correct_frame(
+                    registered_frame, frame_idx
+                )
+            else:
+                corrected_frame = registered_frame
+
             # Apply denoising to recording frame (before view scaling)
             if config.denoise.enabled:
-                denoised_frame = apply_denoise(registered_frame, config.denoise)
+                denoised_frame = apply_denoise(corrected_frame, config.denoise)
             else:
-                denoised_frame = registered_frame
+                denoised_frame = corrected_frame
 
             # Apply view scaling
             scaled_frame = scale_frame(denoised_frame, scaling_params)
@@ -424,6 +470,15 @@ def run_pipeline(config: OverlayConfig, save_thumbnail_flag: bool = True, record
 
             # Write frame
             writer.write_frame(annotated)
+
+            # Save TIFF frame if enabled
+            if save_tiff:
+                save_tiff_frame(
+                    annotated,
+                    output_tiff_dir,
+                    frame_idx,
+                    as_float32=(tiff_format == "float32")
+                )
 
             # Save thumbnail frame
             if frame_idx == thumbnail_idx:
@@ -470,7 +525,9 @@ def run_folder_mode(
     dry_run: bool,
     reuse_output: bool,
     settings_overrides: Optional[dict] = None,
-    recording_only: bool = False
+    recording_only: bool = False,
+    save_tiff: bool = False,
+    tiff_format: str = "uint8"
 ) -> int:
     """
     Run in folder auto-discovery mode.
@@ -482,6 +539,8 @@ def run_folder_mode(
         structure_index: Which structure image to use.
         save_thumbnail_flag: Whether to save thumbnails.
         dry_run: If True, show what would be processed without running.
+        save_tiff: If True, save processed frames as TIFF files.
+        tiff_format: TIFF bit depth: "uint8" or "float32".
 
     Returns:
         Exit code (0 for success).
@@ -587,8 +646,43 @@ def run_folder_mode(
                     if "model" in reg:
                         config.registration.model = reg["model"]
 
+                if "bleach_correction" in settings_overrides:
+                    bc = settings_overrides["bleach_correction"]
+                    if "enabled" in bc:
+                        config.bleach_correction.enabled = bc["enabled"]
+                    if "method" in bc:
+                        config.bleach_correction.method = bc["method"]
+                    if "baseline_frames" in bc:
+                        bf = bc["baseline_frames"]
+                        config.bleach_correction.baseline_frames = tuple(bf) if isinstance(bf, list) else bf
+                    if "poly_order" in bc:
+                        config.bleach_correction.poly_order = bc["poly_order"]
+                    if "epsilon" in bc:
+                        config.bleach_correction.epsilon = bc["epsilon"]
+                    if "apply_mode" in bc:
+                        config.bleach_correction.apply_mode = bc["apply_mode"]
+
+                if "denoise" in settings_overrides:
+                    denoise = settings_overrides["denoise"]
+                    if "enabled" in denoise:
+                        config.denoise.enabled = denoise["enabled"]
+                    if "method" in denoise:
+                        config.denoise.method = denoise["method"]
+                    if "strength" in denoise:
+                        config.denoise.strength = denoise["strength"]
+                    if "device" in denoise:
+                        config.denoise.device = denoise["device"]
+                    if "model_path" in denoise:
+                        config.denoise.model_path = denoise["model_path"]
+
             # Run pipeline
-            run_pipeline(config, save_thumbnail_flag=save_thumbnail_flag, recording_only=recording_only)
+            run_pipeline(
+                config,
+                save_thumbnail_flag=save_thumbnail_flag,
+                recording_only=recording_only,
+                save_tiff=save_tiff,
+                tiff_format=tiff_format
+            )
             success_count += 1
 
         except Exception as e:
@@ -699,7 +793,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                 dry_run=args.dry_run,
                 reuse_output=args.reuse_output,
                 settings_overrides=settings_overrides,
-                recording_only=args.recording_only
+                recording_only=args.recording_only,
+                save_tiff=args.save_tiff,
+                tiff_format=args.tiff_format
             )
 
         else:
@@ -718,7 +814,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
             # Run pipeline
             save_thumb = args.thumbnail and not args.no_thumbnail
-            report = run_pipeline(config, save_thumbnail_flag=save_thumb)
+            report = run_pipeline(
+                config,
+                save_thumbnail_flag=save_thumb,
+                save_tiff=args.save_tiff,
+                tiff_format=args.tiff_format
+            )
 
             logger.info("Processing completed successfully!")
             return 0

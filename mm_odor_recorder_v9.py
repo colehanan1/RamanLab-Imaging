@@ -73,6 +73,7 @@ DEFAULT_SAVE_DIR = str(_user_docs / "Cole" / "Data" / f"Recordings-{_default_dat
 DEFAULT_COM_PORT = "COM3"
 BAUD_RATE = 115200
 ODOR_OPTIONS = ["OFM_A", "OFM_B", "OFM_C", "OFM_H", "OFM_L", "OFM_O", "OFM_E"]
+OFM_P_PIN = "OFM_P"  # Carrier/dilution pin that turns on with every odor
 SOFTWARE_VERSION = '10.0'
 
 # Remote server sync settings
@@ -165,6 +166,7 @@ class LightTheme(ThemeColors):
     WARNING = "#f39c12"
     TEXT_LIGHT = "#ffffff"
     TEXT_DARK = "#2c3e50"
+    TEXT_MED = "#636e72"
     TEXT_MUTED = "#7f8c8d"
     PHASE_BASELINE = "#9b59b6"
     PHASE_ODOR = "#e74c3c"
@@ -191,6 +193,7 @@ class DarkTheme(ThemeColors):
     WARNING = "#d29922"
     TEXT_LIGHT = "#c9d1d9"
     TEXT_DARK = "#c9d1d9"
+    TEXT_MED = "#8b949e"
     TEXT_MUTED = "#8b949e"
     PHASE_BASELINE = "#a371f7"
     PHASE_ODOR = "#f85149"
@@ -651,7 +654,7 @@ class RemoteSyncHandler:
         if progress_callback:
             progress_callback(f"Starting rclone sync: {local_path.name}")
         
-        # Use pre-configured ramanlab remote pointing to \\10.229.137.120\RamanFiles
+        # Use pre-configured ramanlab remote pointing to \\10.229.137.184\RamanFiles
         # Files will go to: RamanFiles/cole/imaging/<experiment_folder>
         remote_target = f"ramanlab:RamanFiles/cole/imaging/{local_path.name}"
         
@@ -1221,8 +1224,12 @@ class MicroManagerController:
             
             # Get actual exposure time - camera will pace based on this
             exposure_ms = self.core.get_exposure()
-            acq_interval_ms = max(int(round(exposure_ms)), int(round(1000.0 / max(float(fps), 0.001))))
-            # If exposure is longer than the requested frame interval, actual FPS will be limited by exposure.
+            # Use the FPS setting to determine frame interval (camera will be limited by exposure if it's longer)
+            acq_interval_ms = int(round(1000.0 / max(float(fps), 0.001)))
+            
+            # Debug logging
+            logger.log("ACQ_TIMING", "CONFIG", 0, odor, odor_sec, fly, geno, 0, 
+                      f"fps={fps} exp={exposure_ms}ms acq_interval={acq_interval_ms}ms")
             
             if total <= 0:
                 self.acquisition_running = False
@@ -1242,9 +1249,6 @@ class MicroManagerController:
 
             global_frame = 0
             last_capture_time = None
-            last_elapsed_ms = None
-            elapsed_times_ms = []
-            use_elapsed = False
             odor_cmd_sent = False
 
             def send_odor_now(frame_idx):
@@ -1260,6 +1264,11 @@ class MicroManagerController:
                     ok_cmd, err = esp32.send_odor(odor, int(round(odor_sec)))
                     logger.log("ODOR_CMD", "ODOR", frame_idx, odor, odor_sec, fly, geno, 0,
                                "" if ok_cmd else f"ESP_ERR:{err}")
+                    
+                    # Also turn on OFM_P (carrier) for the same duration
+                    ok_p, err_p = esp32.send_odor(OFM_P_PIN, int(round(odor_sec)))
+                    logger.log("ODOR_CMD", "CARRIER", frame_idx, OFM_P_PIN, odor_sec, fly, geno, 0,
+                               "" if ok_p else f"ESP_ERR:{err_p}")
 
                     ts_on = None
                     try:
@@ -1281,16 +1290,23 @@ class MicroManagerController:
 
                 odor_cmd_sent = True
 
-            # === ONE CONTINUOUS SEQUENCE ACQUISITION ===
+            # === CONTINUOUS ACQUISITION WITH SOFTWARE FRAME PACING ===
+            # Many camera drivers ignore the interval parameter in
+            # start_sequence_acquisition and run at max hardware speed.
+            # We use continuous acquisition and only keep frames at the
+            # target FPS, draining excess frames to prevent buffer overflow.
             try:
                 self.core.clear_circular_buffer()
             except Exception:
                 pass
 
-            self.core.start_sequence_acquisition(total, acq_interval_ms, True)
+            target_interval_s = 1.0 / max(float(fps), 0.001)
+            total_duration_s = float(base_sec + odor_sec + post_sec)
+
+            self.core.start_continuous_sequence_acquisition(0)
             acq_start_wall = time.time()
             last_gui_update = time.time()
-            expected_time = total * (acq_interval_ms / 1000.0)
+            next_frame_wall = acq_start_wall  # wall-clock time for next kept frame
 
             phase_idx = 0
             current_phase = phases[0]["name"] if phases else ""
@@ -1302,63 +1318,54 @@ class MicroManagerController:
             if odor_frame_start == 0:
                 send_odor_now(0)
 
-            # Collect frames - grab in batches for speed
+            # Collect frames with software pacing
             while global_frame < total:
                 if self.abort_flag.is_set():
                     self.core.stop_sequence_acquisition()
                     raise InterruptedError("Aborted")
 
+                now = time.time()
                 available = self.core.get_remaining_image_count()
-                if available > 0:
-                    batch_count = min(available, total - global_frame)
-                    for _ in range(batch_count):
-                        try:
+
+                if available > 0 and now >= next_frame_wall:
+                    try:
+                        # Grab the most recent frame, drain extras
+                        tagged = self.core.pop_next_tagged_image()
+                        while self.core.get_remaining_image_count() > 0:
                             tagged = self.core.pop_next_tagged_image()
-                            raw = self._tagged_to_raw(tagged).copy()
 
-                            tags = getattr(tagged, "tags", {}) or {}
-                            elapsed_ms = self._extract_elapsed_ms(tags)
-                            if elapsed_ms is not None:
-                                if not use_elapsed:
-                                    use_elapsed = True
-                                if use_elapsed:
-                                    if last_elapsed_ms is not None:
-                                        frame_interval_ms = max(0.0, float(elapsed_ms) - float(last_elapsed_ms))
-                                    else:
-                                        frame_interval_ms = 0
-                                    last_elapsed_ms = float(elapsed_ms)
-                                    elapsed_times_ms.append(float(elapsed_ms))
-                                    capture_time = acq_start_wall + (float(elapsed_ms) / 1000.0)
-                                else:
-                                    capture_time = time.time()
-                                    frame_interval_ms = (capture_time - last_capture_time) * 1000 if last_capture_time else 0
-                            else:
-                                capture_time = time.time()
-                                frame_interval_ms = (capture_time - last_capture_time) * 1000 if last_capture_time else 0
+                        raw = self._tagged_to_raw(tagged).copy()
+                        capture_time = now
+                        frame_interval_ms = (capture_time - last_capture_time) * 1000 if last_capture_time else 0
+                        last_capture_time = capture_time
+                        frame_idx = global_frame
 
-                            last_capture_time = capture_time
-                            frame_idx = global_frame
+                        # Phase transitions
+                        while phase_idx + 1 < len(phases) and frame_idx >= phases[phase_idx]["end"]:
+                            phase_idx += 1
+                            current_phase = phases[phase_idx]["name"]
+                            if phase_cb:
+                                phase_cb(current_phase)
+                            logger.log("PHASE_START", current_phase, frame_idx, odor, odor_sec, fly, geno)
 
-                            while phase_idx + 1 < len(phases) and frame_idx >= phases[phase_idx]["end"]:
-                                phase_idx += 1
-                                current_phase = phases[phase_idx]["name"]
-                                if phase_cb:
-                                    phase_cb(current_phase)
-                                logger.log("PHASE_START", current_phase, frame_idx, odor, odor_sec, fly, geno)
+                        # Odor command
+                        if (not odor_cmd_sent) and (odor_frame_start is not None) and odor_frame_start > 0:
+                            if frame_idx >= (odor_frame_start - 1):
+                                send_odor_now(frame_idx)
 
-                            if (not odor_cmd_sent) and (odor_frame_start is not None) and odor_frame_start > 0:
-                                if frame_idx >= (odor_frame_start - 1):
-                                    send_odor_now(frame_idx)
+                        all_frames.append(raw)
+                        all_times.append(capture_time)
+                        global_frame += 1
 
-                            all_frames.append(raw)
-                            all_times.append(capture_time)
-                            global_frame += 1
-                            logger.log(f"FRAME_{frame_idx}", current_phase, frame_idx, odor, odor_sec, fly, geno,
-                                       frame_interval_ms, ts=capture_time)
-                        except Exception:
-                            dropped += 1
+                        # Schedule next frame based on ideal wall-clock time (prevents drift)
+                        next_frame_wall = acq_start_wall + (global_frame * target_interval_s)
 
-                    now = time.time()
+                        logger.log(f"FRAME_{frame_idx}", current_phase, frame_idx, odor, odor_sec, fly, geno,
+                                   frame_interval_ms, ts=capture_time)
+                    except Exception:
+                        dropped += 1
+
+                    # GUI update (throttled)
                     if now - last_gui_update > 0.2:
                         last_gui_update = now
                         if prog_cb:
@@ -1368,10 +1375,20 @@ class MicroManagerController:
                             max_val = (2 ** self.bit_depth) - 1
                             img8 = (display_raw * (255.0 / max_val)).astype(np.uint8)
                             frame_cb(Image.fromarray(img8), display_raw)
+
+                elif available > 1:
+                    # Camera running ahead of target FPS — drain excess to prevent buffer overflow
+                    while self.core.get_remaining_image_count() > 1:
+                        try:
+                            self.core.pop_next_tagged_image()
+                        except Exception:
+                            break
+                    time.sleep(0.001)
                 else:
                     time.sleep(0.001)
 
-                if time.time() - acq_start_wall > expected_time + 5:
+                # Safety timeout (wall-clock based)
+                if now - acq_start_wall > total_duration_s + 10:
                     print(f"Acquisition timeout: got {global_frame}/{total}")
                     break
 
@@ -1380,11 +1397,8 @@ class MicroManagerController:
             except Exception:
                 pass
             
-            # Calculate actual FPS
-            if len(elapsed_times_ms) > 1:
-                total_acq_time = (elapsed_times_ms[-1] - elapsed_times_ms[0]) / 1000.0
-                actual_fps = (len(elapsed_times_ms) - 1) / total_acq_time if total_acq_time > 0 else 0
-            elif len(all_times) > 1:
+            # Calculate actual FPS from wall-clock timestamps
+            if len(all_times) > 1:
                 total_acq_time = all_times[-1] - all_times[0]
                 actual_fps = (len(all_frames) - 1) / total_acq_time if total_acq_time > 0 else 0
             else:
@@ -3266,7 +3280,7 @@ class OdorRecorderGUI:
             bool: True if successful, False if skipped/failed
         """
         # Create popup instructing user to prepare RFP light
-        result = {"proceed": False, "popup": None}
+        result = {"proceed": False, "popup": None, "exposure_ms": 50.0}
         
         def _show_structure_popup():
             popup = tk.Toplevel(self.root)
@@ -3298,9 +3312,7 @@ class OdorRecorderGUI:
                 "  1. Turn OFF the shutter (no green GCaMP excitation)",
                 "  2. Turn ON the RFP illumination light",
                 "  3. Check focus and adjust if needed",
-                "  4. Press 'Capture' when ready",
-                "",
-                "Settings: 5 images @ 50ms exposure"
+                "  4. Set exposure time and press 'Capture' when ready"
             ]
             
             for line in instructions:
@@ -3309,12 +3321,41 @@ class OdorRecorderGUI:
                 lbl.pack(anchor="w", pady=1)
                 theme_manager.register(lbl, 'BG_MAIN', 'TEXT_DARK')
             
+            # Exposure time input
+            exp_frame = tk.Frame(frm, bg=Theme.BG_MAIN)
+            exp_frame.pack(pady=(12, 0), fill=tk.X)
+            theme_manager.register(exp_frame, 'BG_MAIN')
+            
+            exp_lbl = tk.Label(exp_frame, text="Exposure Time (ms):", font=("Segoe UI", 9, "bold"),
+                              bg=Theme.BG_MAIN, fg=Theme.TEXT_DARK)
+            exp_lbl.pack(side=tk.LEFT, padx=(0, 8))
+            theme_manager.register(exp_lbl, 'BG_MAIN', 'TEXT_DARK')
+            
+            exp_entry = tk.Entry(exp_frame, font=("Segoe UI", 10), width=10)
+            exp_entry.insert(0, "50.0")
+            exp_entry.pack(side=tk.LEFT)
+            
+            exp_info = tk.Label(exp_frame, text="(5 images will be captured)", font=("Segoe UI", 8),
+                               bg=Theme.BG_MAIN, fg=Theme.TEXT_MED)
+            exp_info.pack(side=tk.LEFT, padx=(8, 0))
+            theme_manager.register(exp_info, 'BG_MAIN', 'TEXT_MED')
+            
             btn_frame = tk.Frame(frm, bg=Theme.BG_MAIN)
             btn_frame.pack(pady=(15, 0), fill=tk.X)
             theme_manager.register(btn_frame, 'BG_MAIN')
             
             def on_capture():
-                result["proceed"] = True
+                try:
+                    exposure_val = float(exp_entry.get())
+                    if exposure_val <= 0:
+                        raise ValueError("Exposure must be positive")
+                    result["exposure_ms"] = exposure_val
+                    result["proceed"] = True
+                except ValueError:
+                    # Show error and return without closing
+                    exp_entry.configure(bg="#ffcccc")
+                    self.root.after(500, lambda: exp_entry.configure(bg="white"))
+                    return
                 try:
                     popup.grab_release()
                 except Exception:
@@ -3346,25 +3387,28 @@ class OdorRecorderGUI:
             self._log("Structure recording skipped by user", "WARNING")
             return False
         
+        # Get user-specified exposure time
+        exposure_ms = result["exposure_ms"]
+        
         # Update status
         self._update_proto_status(
             trial_text="Structure Recording",
             phase_text="📸 Capturing RFP images",
             odor_text="—",
-            timing_text="5 images @ 50ms exposure",
+            timing_text=f"5 images @ {exposure_ms}ms exposure",
             camera_text="Recording structure..."
         )
         
         try:
             # Save current exposure
-            original_exp = self.mm.core.get_exposure() if self.mm and self.mm.connected else 50.0
+            original_exp = self.mm.core.get_exposure() if self.mm and self.mm.connected else exposure_ms
             
-            # Set to 50ms exposure for structure imaging
+            # Set to user-specified exposure for structure imaging
             if self.mm and self.mm.connected:
-                self.mm.set_exposure(50.0)
+                self.mm.set_exposure(exposure_ms)
                 time.sleep(0.1)  # Let camera settle
             
-            self._log("Capturing structure images (5 frames @ 50ms)...", "SUCCESS")
+            self._log(f"Capturing structure images (5 frames @ {exposure_ms}ms)...", "SUCCESS")
             
             # Capture 5 images
             n_images = 5
@@ -3808,6 +3852,14 @@ class OdorRecorderGUI:
                     self._protocol_pause_popup(0, context_text="Next fly", on_ready=lambda: self._stop_protocol_replay(clear=True))
                     self._stop_protocol_replay(clear=True)
 
+            # Structure recording: Capture reference images with RFP light after completing all trials
+            structure_post_dir = root_dir / "structure_post"
+            structure_post_dir.mkdir(parents=True, exist_ok=True)
+            
+            if not self._capture_structure_images(structure_post_dir, fps):
+                if not ui_confirm("Post-Structure capture", "Post-protocol structure recording failed or was skipped.\n\nContinue with saving anyway?"):
+                    raise RuntimeError("Post-structure capture aborted by user")
+
             # Write protocol_summary.csv (one row per trial)
             try:
                 if summary_rows:
@@ -3870,7 +3922,7 @@ class OdorRecorderGUI:
                 # Check if rclone is configured (don't crash if it fails)
                 available, info = self.remote_sync.check_availability()
                 if available:
-                    status = f"☁️ Sync enabled: {info} → \\\\10.229.137.120\\RamanFiles\\cole\\imaging"
+                    status = f"☁️ Sync enabled: {info} → \\\\10.229.137.184\\RamanFiles\\cole\\imaging"
                     self.sync_status.config(text=status, fg=Theme.SUCCESS)
                 else:
                     self.sync_status.config(text=f"☁️ {info}", fg=Theme.WARNING)
@@ -3907,7 +3959,7 @@ class OdorRecorderGUI:
             tk.Label(frm, text=f"Status: {info}", font=("Segoe UI", 9),
                     bg=Theme.BG_MAIN, fg=Theme.TEXT_DARK).pack(anchor="w", pady=2)
             
-            tk.Label(frm, text="Destination: \\\\10.229.137.120\\RamanFiles\\cole\\imaging", 
+            tk.Label(frm, text="Destination: \\\\10.229.137.184\\RamanFiles\\cole\\imaging", 
                     font=("Segoe UI", 9),
                     bg=Theme.BG_MAIN, fg=Theme.TEXT_DARK).pack(anchor="w", pady=2)
             

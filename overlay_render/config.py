@@ -52,6 +52,67 @@ class ViewSettings:
 
 
 @dataclass
+class BleachCorrectionSettings:
+    """Settings for bleach/drift correction (recording frames only).
+
+    Global correction fits a smooth trend to the per-frame median intensity
+    and normalises each frame to remove photobleaching drift.  Designed for
+    visualisation (manual labelling), not quantitative analysis.
+    """
+    enabled: bool = False
+    method: Literal["none", "exp_global", "poly_global"] = "none"
+    baseline_frames: Union[int, Tuple[int, int]] = 30
+    poly_order: int = 2
+    epsilon: float = 1e-6
+    apply_mode: Literal["divide", "subtract"] = "divide"
+
+    def __post_init__(self) -> None:
+        if self.method not in ("none", "exp_global", "poly_global"):
+            raise ValueError(
+                f"bleach_correction.method must be 'none', 'exp_global', or 'poly_global', "
+                f"got {self.method}"
+            )
+        # Coerce list → tuple for baseline_frames from YAML
+        if isinstance(self.baseline_frames, list):
+            self.baseline_frames = tuple(self.baseline_frames)
+        if isinstance(self.baseline_frames, tuple):
+            if len(self.baseline_frames) != 2:
+                raise ValueError(
+                    f"bleach_correction.baseline_frames tuple must have 2 elements "
+                    f"(start, end), got {self.baseline_frames}"
+                )
+            if self.baseline_frames[0] >= self.baseline_frames[1]:
+                raise ValueError(
+                    f"bleach_correction.baseline_frames start must be < end, "
+                    f"got {self.baseline_frames}"
+                )
+        elif isinstance(self.baseline_frames, int):
+            if self.baseline_frames < 1:
+                raise ValueError(
+                    f"bleach_correction.baseline_frames must be >= 1, "
+                    f"got {self.baseline_frames}"
+                )
+        else:
+            raise ValueError(
+                f"bleach_correction.baseline_frames must be int or tuple, "
+                f"got {type(self.baseline_frames)}"
+            )
+        if self.poly_order < 1:
+            raise ValueError(
+                f"bleach_correction.poly_order must be >= 1, got {self.poly_order}"
+            )
+        if self.epsilon <= 0:
+            raise ValueError(
+                f"bleach_correction.epsilon must be positive, got {self.epsilon}"
+            )
+        if self.apply_mode not in ("divide", "subtract"):
+            raise ValueError(
+                f"bleach_correction.apply_mode must be 'divide' or 'subtract', "
+                f"got {self.apply_mode}"
+            )
+
+
+@dataclass
 class DenoiseSettings:
     """Settings for denoising (recording frames only)."""
     enabled: bool = False
@@ -156,6 +217,7 @@ class OverlayConfig:
     metadata_json_path: Optional[Path] = None
     overlay: OverlaySettings = field(default_factory=OverlaySettings)
     view: ViewSettings = field(default_factory=ViewSettings)
+    bleach_correction: BleachCorrectionSettings = field(default_factory=BleachCorrectionSettings)
     denoise: DenoiseSettings = field(default_factory=DenoiseSettings)
     registration: RegistrationSettings = field(default_factory=RegistrationSettings)
     annotation: AnnotationSettings = field(default_factory=AnnotationSettings)
@@ -203,6 +265,11 @@ def _parse_nested_config(data: dict, key: str, cls: type) -> Any:
         grid = section["clahe_tile_grid"]
         if isinstance(grid, list):
             section["clahe_tile_grid"] = tuple(grid)
+
+    if cls == BleachCorrectionSettings and "baseline_frames" in section:
+        bf = section["baseline_frames"]
+        if isinstance(bf, list):
+            section["baseline_frames"] = tuple(bf)
 
     # Convert string values to appropriate numeric types
     # YAML sometimes parses scientific notation (1e-5) as strings
@@ -307,6 +374,7 @@ def load_config(
         metadata_json_path=data.get("metadata_json_path"),
         overlay=_parse_nested_config(data, "overlay", OverlaySettings),
         view=_parse_nested_config(data, "view", ViewSettings),
+        bleach_correction=_parse_nested_config(data, "bleach_correction", BleachCorrectionSettings),
         denoise=_parse_nested_config(data, "denoise", DenoiseSettings),
         registration=_parse_nested_config(data, "registration", RegistrationSettings),
         annotation=_parse_annotation_config(data),

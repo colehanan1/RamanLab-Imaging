@@ -25,7 +25,8 @@ import cv2
 import numpy as np
 
 from .denoise import apply_denoise
-from .config import DenoiseSettings
+from .bleach import precompute_bleach_corrector, format_preproc_banner
+from .config import BleachCorrectionSettings, DenoiseSettings
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,17 @@ class PreviewGUI:
         self.use_registration = False
         self.overlay_mode = 0  # 0 = falsecolor, 1 = blend
         self.roi_center = 100  # 100 = full image, 50 = center 50%
+        
+        # Bleach correction parameters
+        self.bleach_enabled = False  # Starts OFF
+        self.bleach_method = 1  # 0=none, 1=exp_global, 2=poly_global
+        self._bleach_corrector = None  # cached BleachCorrector
+        self._last_bleach_params = (None, None)  # (enabled, method) for cache invalidation
+
+        # Denoise parameters (controlled by trackbars)
+        self.denoise_enabled = False  # Starts OFF - user must enable with trackbar
+        self.denoise_method = 1  # Start with bilateral (fast) - user can change to 2=nlm
+        self.denoise_strength = 10  # Default strength for classical methods
 
         # Precompute structure stats (if not recording_only)
         if self.structure is not None:
@@ -87,6 +99,10 @@ class PreviewGUI:
 
         # Registration matrix (computed once if enabled)
         self._registration_matrix = None
+        
+        # Cache for global percentiles (recomputed when p_lo/p_hi/roi_center change)
+        self._cached_global_percentiles = None
+        self._last_percentile_params = (None, None, None)
 
         # Create window and trackbars
         self._setup_window()
@@ -111,6 +127,16 @@ class PreviewGUI:
 
         cv2.createTrackbar("CLAHE", self.window_name, 0, 1, self._on_trackbar)
         cv2.createTrackbar("ROI center %", self.window_name, self.roi_center, 100, self._on_trackbar)
+
+        # Bleach correction controls
+        cv2.createTrackbar("Bleach ON/OFF", self.window_name, 0, 1, self._on_trackbar)
+        cv2.createTrackbar("Bleach (0=none,1=exp,2=poly)", self.window_name, self.bleach_method, 2, self._on_trackbar)
+
+        # Denoise controls (start with bilateral method pre-selected, user just needs to enable)
+        cv2.createTrackbar("Denoise ON/OFF", self.window_name, 0, 1, self._on_trackbar)
+        cv2.createTrackbar("Method (0=none,1=bil,2=nlm)", self.window_name, self.denoise_method, 2, self._on_trackbar)
+        cv2.createTrackbar("Strength", self.window_name, self.denoise_strength, 50, self._on_trackbar)
+        
         cv2.createTrackbar("Frame", self.window_name, self.current_frame_idx,
                           len(self.recording_frames) - 1, self._on_trackbar)
 
@@ -126,6 +152,15 @@ class PreviewGUI:
         self.use_clahe = cv2.getTrackbarPos("CLAHE", self.window_name) == 1
         self.roi_center = cv2.getTrackbarPos("ROI center %", self.window_name)
         self.current_frame_idx = cv2.getTrackbarPos("Frame", self.window_name)
+        
+        # Read bleach trackbars
+        self.bleach_enabled = cv2.getTrackbarPos("Bleach ON/OFF", self.window_name) == 1
+        self.bleach_method = cv2.getTrackbarPos("Bleach (0=none,1=exp,2=poly)", self.window_name)
+
+        # Read denoise trackbars
+        self.denoise_enabled = cv2.getTrackbarPos("Denoise ON/OFF", self.window_name) == 1
+        self.denoise_method = cv2.getTrackbarPos("Method (0=none,1=bil,2=nlm)", self.window_name)
+        self.denoise_strength = cv2.getTrackbarPos("Strength", self.window_name)
 
         # Only read overlay controls if not recording_only
         if not self.recording_only:
@@ -141,24 +176,55 @@ class PreviewGUI:
         # Allow ROI down to 1% (but not 0 to avoid division issues)
         self.roi_center = max(1, self.roi_center)
 
-    def _scale_image(self, img: np.ndarray, p_lo: float, p_hi: float, roi_fraction: float = 1.0) -> np.ndarray:
-        """Apply percentile scaling to image, optionally using center ROI for stats."""
-        # Use center ROI for computing percentiles if roi_fraction < 1
+    def _compute_global_percentiles(self, p_lo: float, p_hi: float, roi_fraction: float = 1.0) -> tuple:
+        """
+        Compute global percentiles across ALL loaded frames.
+        This matches the behavior of the main pipeline which uses compute_global_scaling_params().
+        Results are cached to avoid recomputation unless parameters change.
+        """
+        current_params = (p_lo, p_hi, roi_fraction)
+        
+        # Return cached result if parameters haven't changed
+        if self._cached_global_percentiles is not None and self._last_percentile_params == current_params:
+            return self._cached_global_percentiles
+        
+        logger.info(f"Computing global percentiles (p_lo={p_lo}, p_hi={p_hi}, roi={roi_fraction*100:.0f}%)...")
+        
+        # Stack all frames to compute global percentiles
         if roi_fraction < 1.0:
-            h, w = img.shape[:2]
+            # Extract center ROI from all frames
+            h, w = self.recording_frames[0].shape[:2]
             margin_h = int(h * (1 - roi_fraction) / 2)
             margin_w = int(w * (1 - roi_fraction) / 2)
-            roi = img[margin_h:h-margin_h, margin_w:w-margin_w]
+            roi_stack = np.stack([
+                f[margin_h:h-margin_h, margin_w:w-margin_w]
+                for f in self.recording_frames
+            ], axis=0)
         else:
-            roi = img
-
-        vmin = np.percentile(roi, p_lo)
-        vmax = np.percentile(roi, p_hi)
-
+            roi_stack = np.stack(self.recording_frames, axis=0)
+        
+        vmin = float(np.percentile(roi_stack, p_lo))
+        vmax = float(np.percentile(roi_stack, p_hi))
+        
         if vmax <= vmin:
             vmax = vmin + 1
+        
+        logger.info(f"Global percentiles computed: vmin={vmin:.2f}, vmax={vmax:.2f}")
+        
+        # Cache result
+        self._cached_global_percentiles = (vmin, vmax)
+        self._last_percentile_params = current_params
+        
+        return vmin, vmax
 
-        # Scale the FULL image using ROI-derived stats
+    def _scale_image(self, img: np.ndarray, p_lo: float, p_hi: float, roi_fraction: float = 1.0) -> np.ndarray:
+        """
+        Apply global percentile scaling to image.
+        Uses pre-computed global percentiles across all frames (matches main pipeline behavior).
+        """
+        vmin, vmax = self._compute_global_percentiles(p_lo, p_hi, roi_fraction)
+        
+        # Scale the image using global stats
         scaled = (img - vmin) / (vmax - vmin)
         scaled = np.clip(scaled, 0, 1)
         return scaled
@@ -255,15 +321,33 @@ class PreviewGUI:
         # Settings text
         gamma_val = self.gamma / 10.0
         roi_pct = self.roi_center
+        
+        # Bleach status string
+        if self.bleach_enabled and self.bleach_method > 0:
+            bleach_method_names = {0: "none", 1: "exp_global", 2: "poly_global"}
+            bleach_str = f"Bleach: {bleach_method_names[self.bleach_method]}"
+        else:
+            bleach_str = "Bleach: OFF"
+
+        # Denoise status string
+        if self.denoise_enabled and self.denoise_method > 0:
+            method_names = {0: "none", 1: "bilateral", 2: "nlm"}
+            denoise_str = f"Denoise: {method_names[self.denoise_method]} (strength={self.denoise_strength})"
+        else:
+            denoise_str = "Denoise: OFF"
 
         if self.recording_only:
             lines = [
-                "=== BRIGHTNESS/CONTRAST (like Fiji) ===",
+                "=== BRIGHTNESS/CONTRAST (GLOBAL percentiles across ALL frames) ===",
                 f"p_lo: {self.p_lo}   <- MIN: slide RIGHT to darken background",
                 f"p_hi: {self.p_hi}  <- MAX: slide LEFT to brighten signal",
                 f"gamma: {gamma_val:.1f}  <- midtone adjust (1.0 = off)",
                 f"ROI: {roi_pct}%   <- area used for min/max calc (lower = center only)",
                 f"CLAHE: {'ON' if self.use_clahe else 'OFF'}    <- local contrast enhancement",
+                "",
+                f"=== PREPROCESS ===",
+                bleach_str,
+                denoise_str,
                 "",
                 f"Frame: {self.current_frame_idx + 1}/{len(self.recording_frames)}  |  MODE: RECORDING ONLY",
                 "",
@@ -273,7 +357,7 @@ class PreviewGUI:
             alpha_val = self.alpha / 100.0
             mode_str = "falsecolor" if self.overlay_mode == 0 else "blend"
             lines = [
-                "=== BRIGHTNESS/CONTRAST ===",
+                "=== BRIGHTNESS/CONTRAST (GLOBAL percentiles across ALL frames) ===",
                 f"p_lo: {self.p_lo}   <- MIN: slide RIGHT to darken background",
                 f"p_hi: {self.p_hi}  <- MAX: slide LEFT to brighten signal",
                 f"gamma: {gamma_val:.1f}  <- midtone adjust (1.0 = off)",
@@ -283,6 +367,10 @@ class PreviewGUI:
                 f"alpha: {alpha_val:.2f}  <- recording blend (1=full green, 0=full magenta)",
                 f"mode: {mode_str}  <- falsecolor=pink+green, blend=grayscale",
                 f"CLAHE: {'ON' if self.use_clahe else 'OFF'}  Reg: {'ON' if self.use_registration else 'OFF'}",
+                "",
+                f"=== PREPROCESS ===",
+                bleach_str,
+                denoise_str,
                 "",
                 f"Frame: {self.current_frame_idx + 1}/{len(self.recording_frames)}",
                 "",
@@ -299,6 +387,40 @@ class PreviewGUI:
 
         return img_display
 
+    def _get_bleach_corrector(self):
+        """Get or rebuild cached bleach corrector based on current trackbar settings."""
+        bleach_method_map = {0: "none", 1: "exp_global", 2: "poly_global"}
+        method_str = bleach_method_map.get(self.bleach_method, "none")
+
+        current_params = (self.bleach_enabled, method_str)
+        if self._bleach_corrector is not None and self._last_bleach_params == current_params:
+            return self._bleach_corrector
+
+        if not self.bleach_enabled or method_str == "none":
+            self._bleach_corrector = None
+            self._last_bleach_params = current_params
+            return None
+
+        try:
+            settings = BleachCorrectionSettings(
+                enabled=True,
+                method=method_str,
+                baseline_frames=min(30, len(self.recording_frames)),
+                apply_mode="divide",
+            )
+            self._bleach_corrector = precompute_bleach_corrector(
+                settings=settings,
+                frames=self.recording_frames,
+            )
+            self._last_bleach_params = current_params
+            logger.info(f"Bleach corrector rebuilt: method={method_str}")
+        except Exception as e:
+            logger.error(f"Bleach correction failed: {e}")
+            self._bleach_corrector = None
+            self._last_bleach_params = current_params
+
+        return self._bleach_corrector
+
     def render(self) -> np.ndarray:
         """Render current preview frame."""
         self._read_trackbars()
@@ -310,12 +432,33 @@ class PreviewGUI:
         if not self.recording_only and self.use_registration:
             frame = self._apply_registration(frame)
 
-        # Apply denoising (placeholder - denoise not yet in preview GUI controls)
-        # When denoise controls are added to GUI, apply here before scaling
-        # For now, denoise is disabled in preview (no trackbars yet)
-        denoise_settings = DenoiseSettings(enabled=False)
-        if denoise_settings.enabled:
-            frame = apply_denoise(frame, denoise_settings)
+        # Apply bleach correction (before denoise)
+        corrector = self._get_bleach_corrector()
+        if corrector is not None:
+            frame = corrector.correct_frame(frame, self.current_frame_idx)
+
+        # Apply denoising if enabled
+        if self.denoise_enabled and self.denoise_method > 0:
+            # Map method trackbar to method string
+            method_map = {
+                0: "none",
+                1: "bilateral",
+                2: "nlm"
+            }
+            method_str = method_map.get(self.denoise_method, "none")
+            
+            try:
+                denoise_settings = DenoiseSettings(
+                    enabled=True,
+                    method=method_str,
+                    strength=float(self.denoise_strength),
+                    device="cpu"  # Preview always uses CPU for responsiveness
+                )
+                frame = apply_denoise(frame, denoise_settings)
+                logger.debug(f"Applied {method_str} denoise with strength {self.denoise_strength}")
+            except Exception as e:
+                logger.error(f"Denoise failed: {e}")
+                # Continue without denoise if it fails
 
         # Scale images
         gamma_val = self.gamma / 10.0
@@ -379,10 +522,28 @@ class PreviewGUI:
         if roi_fraction < 1.0:
             settings["view"]["roi_center_fraction"] = roi_fraction
 
-        # Include denoise settings only if non-default (placeholder for future GUI controls)
-        # Currently denoise is not exposed in preview GUI, so always disabled
-        # When denoise controls are added, include here if enabled
-        
+        # Include bleach correction settings if enabled
+        if self.bleach_enabled and self.bleach_method > 0:
+            bleach_map = {0: "none", 1: "exp_global", 2: "poly_global"}
+            bleach_method_str = bleach_map.get(self.bleach_method, "none")
+            settings["bleach_correction"] = {
+                "enabled": True,
+                "method": bleach_method_str,
+                "baseline_frames": 30,
+                "apply_mode": "divide",
+            }
+
+        # Include denoise settings if enabled
+        if self.denoise_enabled and self.denoise_method > 0:
+            method_map = {0: "none", 1: "bilateral", 2: "nlm"}
+            method_str = method_map.get(self.denoise_method, "none")
+            settings["denoise"] = {
+                "enabled": True,
+                "method": method_str,
+                "strength": float(self.denoise_strength),
+                "device": "auto"
+            }
+
         return settings
 
     def save_settings(self, path: Path):

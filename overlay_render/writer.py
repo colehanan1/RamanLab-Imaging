@@ -181,6 +181,49 @@ def save_thumbnail(
     logger.info(f"Thumbnail saved: {output_path}")
 
 
+def save_tiff_frame(
+    frame: np.ndarray,
+    output_path: Union[str, Path],
+    frame_idx: int,
+    as_float32: bool = False
+) -> None:
+    """
+    Save a single frame as a TIFF file.
+
+    Args:
+        frame: Frame as uint8 or float32 array (H, W, 3) or (H, W).
+        output_path: Directory path for TIFF output.
+        frame_idx: Frame index for naming.
+        as_float32: If True, save as float32 TIFF (preserves dynamic range).
+                   If False, convert to uint8 (smaller files).
+    """
+    try:
+        import imageio.v3 as iio
+    except ImportError:
+        raise ImportError(
+            "imageio is required for TIFF saving. "
+            "Install with: pip install imageio"
+        )
+
+    output_path = Path(output_path)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # Generate filename with zero-padded frame number
+    filename = output_path / f"frame_{frame_idx:06d}.tif"
+
+    # Convert to appropriate format
+    if as_float32:
+        # Save as float32 to preserve dynamic range
+        if frame.dtype != np.float32:
+            frame = frame.astype(np.float32)
+    else:
+        # Convert to uint8 for smaller file sizes
+        if frame.dtype != np.uint8:
+            frame = frame.astype(np.uint8)
+
+    iio.imwrite(filename, frame)
+
+
 def get_video_info(path: Union[str, Path]) -> dict:
     """
     Get information about a video file.
