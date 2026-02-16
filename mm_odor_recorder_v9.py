@@ -776,7 +776,7 @@ class MicroManagerController:
         self.preview_running = False
         self.preview_callback = None
         self._preview_lock = threading.Lock()
-        
+
         # Camera properties (cached after connect)
         self.camera = ""
         self.exp_min, self.exp_max = 0.1, 5000
@@ -786,6 +786,10 @@ class MicroManagerController:
         self.binning_opts = ["1", "2", "4"]
         self.bit_depth = 16
         self.img_w, self.img_h = 512, 512
+
+        # Acquisition timing defaults (5 ms exposure, 20 fps target)
+        self._default_exposure_ms = 5.0
+        self._default_fps = 20.0
     
     def connect(self):
         if not PYCROMANAGER_AVAILABLE:
@@ -872,7 +876,76 @@ class MicroManagerController:
             except:
                 pass
         return False
-    
+
+    def configure_acquisition_timing(self, exposure_ms=5.0, target_fps=20.0):
+        """
+        Configure camera for high-speed acquisition.
+
+        Sets:
+          - Exposure time (ms) - CAMERA CONTROLS THIS
+          - Frame rate (Hz) - via FrameRate property if available, otherwise free-running
+
+        Args:
+            exposure_ms (float): Exposure time in milliseconds (default 5.0 ms)
+            target_fps (float): Target frame rate in Hz (default 20.0)
+
+        Returns:
+            (success: bool, message: str, exposure_actual_ms: float)
+        """
+        if not self.connected:
+            return False, "Not connected", 0.0
+
+        try:
+            # ===== SET EXPOSURE (MANDATORY) =====
+            # The camera's hardware exposure time is the first limiting factor for FPS.
+            # At 5 ms exposure, the camera cannot acquire faster than 200 FPS.
+            self.core.set_exposure(float(exposure_ms))
+            exposure_set = self.core.get_exposure()
+            print(f"[ACQUISITION] Exposure set to {exposure_set:.2f} ms")
+
+            # ===== ATTEMPT TO SET FRAME RATE (OPTIONAL) =====
+            # Many modern cameras expose a FrameRate or AcquisitionFrameRate property.
+            # This is the PREFERRED way to enforce 20 fps at the hardware level.
+            frame_rate_set = False
+            for frame_rate_prop in ["FrameRate", "AcquisitionFrameRate", "Frame Rate"]:
+                try:
+                    if self.core.has_property(self.camera, frame_rate_prop):
+                        # Some properties may have constraints; query allowed values
+                        try:
+                            allowed = self.core.get_allowed_property_values(self.camera, frame_rate_prop)
+                            if allowed.size() > 0:
+                                # If constraints exist, use the closest allowed value
+                                allowed_list = [float(allowed.get(i)) for i in range(allowed.size())]
+                                closest_fps = min(allowed_list, key=lambda x: abs(x - target_fps))
+                                self.core.set_property(self.camera, frame_rate_prop, str(closest_fps))
+                            else:
+                                # No constraints; set directly
+                                self.core.set_property(self.camera, frame_rate_prop, str(float(target_fps)))
+                        except Exception:
+                            # If allowed values query fails, try setting directly
+                            self.core.set_property(self.camera, frame_rate_prop, str(float(target_fps)))
+
+                        fps_actual = self.core.get_property(self.camera, frame_rate_prop)
+                        print(f"[ACQUISITION] Frame rate set via '{frame_rate_prop}': {fps_actual} Hz")
+                        frame_rate_set = True
+                        break
+                except Exception:
+                    continue
+
+            if not frame_rate_set:
+                # Fallback: Camera will free-run at max speed for 5 ms exposure
+                # In this case, we rely on software pacing (next_frame_wall logic in acquire_multiphase)
+                # to keep only frames at the target FPS.
+                print(f"[ACQUISITION] No FrameRate property found; camera free-running at max speed for {exposure_set:.1f}ms exposure")
+                print(f"[ACQUISITION] Target {target_fps} fps will be enforced in software via frame pacing")
+
+            return True, "Acquisition timing configured", exposure_set
+
+        except Exception as e:
+            msg = f"Failed to configure acquisition timing: {e}"
+            print(f"[ACQUISITION] ERROR: {msg}")
+            return False, msg, 0.0
+
     def get_binning(self):
         if self.connected:
             try:
@@ -1166,26 +1239,45 @@ class MicroManagerController:
         return None
 
     def acquire_multiphase(self, fps, base_sec, odor_sec, post_sec, save_dir, logger,
-                          odor, fly, geno, esp32, prog_cb, phase_cb, save_video=False, frame_cb=None):
+                          odor, fly, geno, esp32, prog_cb, phase_cb, save_video=False, frame_cb=None,
+                          exposure_ms=5.0):
         """
-        High-speed acquisition using Micro-Manager's sequence acquisition.
-        
-        Key optimization: Let the CAMERA handle timing internally via sequence acquisition.
-        We grab frames in batches, not one-at-a-time with Python timing.
+        High-speed acquisition using Micro-Manager's continuous sequence acquisition.
+
+        TIMING CONTROL:
+          - Exposure is set at the CAMERA level via configure_acquisition_timing()
+          - Frame rate is also set at the camera level if a FrameRate property exists
+          - If no hardware frame-rate control, software pacing via wall-clock timing ensures target FPS
+          - This approach eliminates MDA overhead and uses the circular buffer efficiently
+
+        Args:
+            fps (float): Target frame rate in Hz (default behavior respects camera exposure limit)
+            base_sec, odor_sec, post_sec (float): Phase durations in seconds
+            save_dir (Path): Directory to save frames
+            logger (TimestampLogger): Logger for event timestamps
+            odor, fly, geno (str): Metadata
+            esp32 (ESP32Controller): Odor delivery controller
+            prog_cb, phase_cb: Progress and phase callbacks
+            save_video (bool): Whether to save AVI file
+            frame_cb: Live display callback
+            exposure_ms (float): Camera exposure time in milliseconds (default 5.0 ms)
+
+        Returns:
+            (success: bool, message: str, metrics: dict)
         """
         if not self.connected:
             return False, "Not connected", {}
-        
+
         was_previewing = self.preview_running
         self.stop_preview()
         self.abort_flag.clear()
         self.acquisition_running = True
-        
+
         b_frames = int(base_sec * fps)
         o_frames = int(odor_sec * fps)
         p_frames = int(post_sec * fps)
         total = b_frames + o_frames + p_frames
-        
+
         # All frames stored here
         all_frames = []
         all_times = []
@@ -1216,20 +1308,29 @@ class MicroManagerController:
             "odor_frame_end": None,
             "odor_on_ts_esp": None,
             "odor_off_ts_esp": None,
+            "exposure_ms_set": exposure_ms,
         }
-        
+
         try:
             img_dir = save_dir / "images"
             img_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Get actual exposure time - camera will pace based on this
-            exposure_ms = self.core.get_exposure()
-            # Use the FPS setting to determine frame interval (camera will be limited by exposure if it's longer)
-            acq_interval_ms = int(round(1000.0 / max(float(fps), 0.001)))
-            
-            # Debug logging
-            logger.log("ACQ_TIMING", "CONFIG", 0, odor, odor_sec, fly, geno, 0, 
-                      f"fps={fps} exp={exposure_ms}ms acq_interval={acq_interval_ms}ms")
+
+            # ===== CONFIGURE CAMERA TIMING (CRITICAL) =====
+            # This sets:
+            #   1. Exposure time to 5.0 ms (hardware-level, mandatory)
+            #   2. Frame rate to 20 fps via FrameRate property if available (hardware-level, preferred)
+            #   3. Falls back to free-running with software pacing if no FrameRate property
+            ok_timing, msg_timing, exposure_actual = self.configure_acquisition_timing(
+                exposure_ms=exposure_ms, target_fps=fps
+            )
+            if not ok_timing:
+                logger.log("ACQ_CONFIG_FAILED", "ERROR", 0, odor, odor_sec, fly, geno, 0, msg_timing)
+                self.acquisition_running = False
+                return False, msg_timing, {}
+
+            # Log the configuration
+            logger.log("ACQ_TIMING", "CONFIG", 0, odor, odor_sec, fly, geno, 0,
+                      f"fps_target={fps} exposure_ms={exposure_actual:.2f} (camera hardware paced)")
             
             if total <= 0:
                 self.acquisition_running = False
@@ -1290,11 +1391,20 @@ class MicroManagerController:
 
                 odor_cmd_sent = True
 
-            # === CONTINUOUS ACQUISITION WITH SOFTWARE FRAME PACING ===
-            # Many camera drivers ignore the interval parameter in
-            # start_sequence_acquisition and run at max hardware speed.
-            # We use continuous acquisition and only keep frames at the
-            # target FPS, draining excess frames to prevent buffer overflow.
+            # === CONTINUOUS ACQUISITION WITH OPTIONAL SOFTWARE PACING ===
+            # HARDWARE TIMING:
+            #   - Camera exposure is fixed at exposure_ms (e.g., 5.0 ms) via configure_acquisition_timing()
+            #   - If FrameRate property was set, camera will acquire at target_fps (20 Hz) in hardware
+            #
+            # SOFTWARE TIMING:
+            #   - If no FrameRate property, camera runs at max speed (~200 fps for 5 ms exposure)
+            #   - We use next_frame_wall (wall-clock based) to select only frames at target_fps
+            #   - This prevents buffer overflow and ensures consistent frame intervals
+            #
+            # FRAME BUFFER MANAGEMENT:
+            #   - Micro-Manager's circular buffer holds camera frames
+            #   - We pop frames when available, drain extras to prevent memory buildup
+            #   - Frame interval is measured from wall-clock time, not camera timestamps
             try:
                 self.core.clear_circular_buffer()
             except Exception:
@@ -1303,6 +1413,7 @@ class MicroManagerController:
             target_interval_s = 1.0 / max(float(fps), 0.001)
             total_duration_s = float(base_sec + odor_sec + post_sec)
 
+            # Start continuous acquisition at max speed (camera will respect exposure & frame-rate properties)
             self.core.start_continuous_sequence_acquisition(0)
             acq_start_wall = time.time()
             last_gui_update = time.time()
@@ -1585,6 +1696,21 @@ class MicroManagerController:
     
     def abort(self):
         self.abort_flag.set()
+
+    def set_acquisition_defaults(self, exposure_ms=5.0, fps=20.0):
+        """
+        Convenience method to store default acquisition parameters.
+
+        Call this from the UI before starting a recording to ensure all acquisitions
+        use consistent high-speed settings.
+
+        Args:
+            exposure_ms (float): Camera exposure in milliseconds (default 5.0)
+            fps (float): Target frame rate in Hz (default 20.0)
+        """
+        self._default_exposure_ms = float(exposure_ms)
+        self._default_fps = float(fps)
+        print(f"[ACQUISITION] Defaults set: {exposure_ms} ms exposure, {fps} fps target")
 
 # =============================================================================
 # LIVE PREVIEW PANEL
