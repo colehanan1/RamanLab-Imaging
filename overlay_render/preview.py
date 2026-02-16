@@ -40,7 +40,8 @@ class PreviewGUI:
         recording_frames: list,
         window_name: str = "Overlay Preview - Press 'q' to quit, 's' to save settings",
         recording_only: bool = False,
-        start_frame: int = None
+        start_frame: int = None,
+        total_recording_frames: int = None,
     ):
         """
         Initialize preview GUI.
@@ -51,7 +52,10 @@ class PreviewGUI:
             window_name: OpenCV window name.
             recording_only: If True, show only recording (grayscale, no overlay).
             start_frame: Initial frame index to display.
+            total_recording_frames: Total frames in the full recording (for DFF
+                baseline range trackbars). Defaults to len(recording_frames).
         """
+        self.total_recording_frames = total_recording_frames or len(recording_frames)
         self.recording_only = recording_only
         self.recording_frames = [f.astype(np.float32) for f in recording_frames]
 
@@ -88,6 +92,20 @@ class PreviewGUI:
         self.denoise_enabled = False  # Starts OFF - user must enable with trackbar
         self.denoise_method = 1  # Start with bilateral (fast) - user can change to 2=nlm
         self.denoise_strength = 10  # Default strength for classical methods
+
+        # DFF parameters (config toggles — saved to YAML, not rendered live)
+        self.dff_enabled = False
+        self.dff_baseline_source = 0  # 0=odor, 1=explicit
+        self.dff_f0_method = 0        # 0=mean, 1=percentile
+        # Explicit baseline frame range (uses actual recording frame count)
+        # Default: first 40% of frames as baseline
+        self.dff_baseline_start = 0
+        self.dff_baseline_end = max(1, int(self.total_recording_frames * 0.4))
+
+        # Projection parameters (config toggles — saved to YAML)
+        self.proj_enabled = False
+        self.proj_rgb_epochs = 1   # ON by default
+        self.proj_save_tiff = 0
 
         # Precompute structure stats (if not recording_only)
         if self.structure is not None:
@@ -136,7 +154,21 @@ class PreviewGUI:
         cv2.createTrackbar("Denoise ON/OFF", self.window_name, 0, 1, self._on_trackbar)
         cv2.createTrackbar("Method (0=none,1=bil,2=nlm)", self.window_name, self.denoise_method, 2, self._on_trackbar)
         cv2.createTrackbar("Strength", self.window_name, self.denoise_strength, 50, self._on_trackbar)
-        
+
+        # DFF controls (config toggles — not rendered live, saved to YAML)
+        cv2.createTrackbar("DFF ON/OFF", self.window_name, 0, 1, self._on_trackbar)
+        cv2.createTrackbar("DFF Base (0=odor,1=explicit)", self.window_name, 0, 1, self._on_trackbar)
+        cv2.createTrackbar("DFF F0 (0=mean,1=pctl)", self.window_name, 0, 1, self._on_trackbar)
+        # Baseline frame range for explicit mode (uses actual recording frame count)
+        max_frame = self.total_recording_frames - 1
+        cv2.createTrackbar("DFF Base Start", self.window_name, self.dff_baseline_start, max_frame, self._on_trackbar)
+        cv2.createTrackbar("DFF Base End", self.window_name, self.dff_baseline_end, max_frame, self._on_trackbar)
+
+        # Projection controls (config toggles — saved to YAML)
+        cv2.createTrackbar("Proj ON/OFF", self.window_name, 0, 1, self._on_trackbar)
+        cv2.createTrackbar("Proj RGB Epochs", self.window_name, self.proj_rgb_epochs, 1, self._on_trackbar)
+        cv2.createTrackbar("Proj Save TIFF", self.window_name, 0, 1, self._on_trackbar)
+
         cv2.createTrackbar("Frame", self.window_name, self.current_frame_idx,
                           len(self.recording_frames) - 1, self._on_trackbar)
 
@@ -161,6 +193,21 @@ class PreviewGUI:
         self.denoise_enabled = cv2.getTrackbarPos("Denoise ON/OFF", self.window_name) == 1
         self.denoise_method = cv2.getTrackbarPos("Method (0=none,1=bil,2=nlm)", self.window_name)
         self.denoise_strength = cv2.getTrackbarPos("Strength", self.window_name)
+
+        # Read DFF trackbars
+        self.dff_enabled = cv2.getTrackbarPos("DFF ON/OFF", self.window_name) == 1
+        self.dff_baseline_source = cv2.getTrackbarPos("DFF Base (0=odor,1=explicit)", self.window_name)
+        self.dff_f0_method = cv2.getTrackbarPos("DFF F0 (0=mean,1=pctl)", self.window_name)
+        self.dff_baseline_start = cv2.getTrackbarPos("DFF Base Start", self.window_name)
+        self.dff_baseline_end = cv2.getTrackbarPos("DFF Base End", self.window_name)
+        # Ensure start <= end
+        if self.dff_baseline_start > self.dff_baseline_end:
+            self.dff_baseline_start = self.dff_baseline_end
+
+        # Read projection trackbars
+        self.proj_enabled = cv2.getTrackbarPos("Proj ON/OFF", self.window_name) == 1
+        self.proj_rgb_epochs = cv2.getTrackbarPos("Proj RGB Epochs", self.window_name)
+        self.proj_save_tiff = cv2.getTrackbarPos("Proj Save TIFF", self.window_name)
 
         # Only read overlay controls if not recording_only
         if not self.recording_only:
@@ -336,6 +383,28 @@ class PreviewGUI:
         else:
             denoise_str = "Denoise: OFF"
 
+        # DFF status string
+        if self.dff_enabled:
+            dff_base = "odor" if self.dff_baseline_source == 0 else "explicit"
+            dff_f0 = "mean" if self.dff_f0_method == 0 else "percentile"
+            if self.dff_baseline_source == 1:  # explicit
+                dff_str = f"DFF: ON (baseline=explicit [{self.dff_baseline_start}-{self.dff_baseline_end}], f0={dff_f0})"
+            else:
+                dff_str = f"DFF: ON (baseline=odor [auto], f0={dff_f0})"
+        else:
+            dff_str = "DFF: OFF"
+
+        # Projection status string
+        if self.proj_enabled:
+            proj_parts = ["ON"]
+            if self.proj_rgb_epochs:
+                proj_parts.append("RGB")
+            if self.proj_save_tiff:
+                proj_parts.append("+TIFF")
+            proj_str = f"Proj: {' '.join(proj_parts)}"
+        else:
+            proj_str = "Proj: OFF"
+
         if self.recording_only:
             lines = [
                 "=== BRIGHTNESS/CONTRAST (GLOBAL percentiles across ALL frames) ===",
@@ -348,6 +417,10 @@ class PreviewGUI:
                 f"=== PREPROCESS ===",
                 bleach_str,
                 denoise_str,
+                "",
+                f"=== ANALYSIS (pipeline config) ===",
+                dff_str,
+                proj_str,
                 "",
                 f"Frame: {self.current_frame_idx + 1}/{len(self.recording_frames)}  |  MODE: RECORDING ONLY",
                 "",
@@ -371,6 +444,10 @@ class PreviewGUI:
                 f"=== PREPROCESS ===",
                 bleach_str,
                 denoise_str,
+                "",
+                f"=== ANALYSIS (pipeline config) ===",
+                dff_str,
+                proj_str,
                 "",
                 f"Frame: {self.current_frame_idx + 1}/{len(self.recording_frames)}",
                 "",
@@ -544,6 +621,32 @@ class PreviewGUI:
                 "device": "auto"
             }
 
+        # Include DFF settings if enabled
+        if self.dff_enabled:
+            baseline_map = {0: "odor", 1: "explicit"}
+            f0_map = {0: "mean", 1: "percentile"}
+            dff_settings = {
+                "enabled": True,
+                "baseline_source": baseline_map.get(self.dff_baseline_source, "odor"),
+                "f0_method": f0_map.get(self.dff_f0_method, "mean"),
+                "save_tiff": True,
+            }
+            if self.dff_baseline_source == 1:  # explicit
+                dff_settings["baseline_frames"] = [
+                    self.dff_baseline_start,
+                    self.dff_baseline_end,
+                ]
+            settings["dff"] = dff_settings
+
+        # Include projection settings if enabled
+        if self.proj_enabled:
+            settings["projections"] = {
+                "enabled": True,
+                "save_png": True,
+                "save_tiff": bool(self.proj_save_tiff),
+                "make_rgb_epochs": bool(self.proj_rgb_epochs),
+            }
+
         return settings
 
     def save_settings(self, path: Path):
@@ -616,7 +719,7 @@ def load_preview_data(
     recording_path: Optional[Path] = None,
     n_frames: int = 10,
     trial_index: int = 0,
-) -> Tuple[np.ndarray, list]:
+) -> Tuple[np.ndarray, list, int]:
     """
     Load data for preview.
 
@@ -628,7 +731,7 @@ def load_preview_data(
         trial_index: Which trial to use (folder mode).
 
     Returns:
-        Tuple of (structure, list of recording frames).
+        Tuple of (structure, list of recording frames, total_recording_frames).
     """
     from .loaders import load_structure, load_recording
 
@@ -657,7 +760,7 @@ def load_preview_data(
     frames = [recording.get_frame(i) for i in indices]
     recording.close()
 
-    return structure, frames
+    return structure, frames, total_frames
 
 
 def main(argv=None):
@@ -695,17 +798,17 @@ def main(argv=None):
     try:
         # Load data
         print("Loading data for preview...")
-        structure, frames = load_preview_data(
+        structure, frames, total_frames = load_preview_data(
             folder=args.folder,
             structure_path=args.structure,
             recording_path=args.recording,
             n_frames=args.frames,
             trial_index=args.trial,
         )
-        print(f"Loaded structure: {structure.shape}, {len(frames)} preview frames")
+        print(f"Loaded structure: {structure.shape}, {len(frames)} preview frames ({total_frames} total in recording)")
 
         # Run GUI
-        gui = PreviewGUI(structure, frames)
+        gui = PreviewGUI(structure, frames, total_recording_frames=total_frames)
         final_settings = gui.run()
 
         print("\nFinal settings:")

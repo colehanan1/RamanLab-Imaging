@@ -131,6 +131,98 @@ class DenoiseSettings:
 
 
 @dataclass
+class DffSettings:
+    """Settings for ΔF/F (delta-F over F0) computation.
+
+    When enabled, computes (F - F0) / (F0 + eps) for each frame and
+    optionally saves the result as a float32 TIFF stack.  The DFF frames
+    can also be routed through the existing view-scaling / overlay pipeline
+    to produce an MP4 rendered from ΔF/F values instead of raw intensities.
+    """
+    enabled: bool = False
+    baseline_source: Literal["odor", "explicit"] = "odor"
+    baseline_frames: Optional[Tuple[int, int]] = None  # inclusive [start, end]
+    f0_method: Literal["mean", "percentile"] = "mean"
+    f0_percentile: float = 20.0
+    eps: float = 1e-6
+    clip: Optional[Tuple[float, float]] = None  # e.g. [-0.2, 2.0]
+    save_tiff: bool = True
+    output_name: str = "dff.tif"
+
+    def __post_init__(self) -> None:
+        if self.baseline_source not in ("odor", "explicit"):
+            raise ValueError(
+                f"dff.baseline_source must be 'odor' or 'explicit', "
+                f"got '{self.baseline_source}'"
+            )
+        if self.f0_method not in ("mean", "percentile"):
+            raise ValueError(
+                f"dff.f0_method must be 'mean' or 'percentile', "
+                f"got '{self.f0_method}'"
+            )
+        if self.f0_percentile < 0 or self.f0_percentile > 100:
+            raise ValueError(
+                f"dff.f0_percentile must be in [0, 100], got {self.f0_percentile}"
+            )
+        if self.eps <= 0:
+            raise ValueError(f"dff.eps must be positive, got {self.eps}")
+        # Coerce list → tuple for fields from YAML
+        if isinstance(self.baseline_frames, list):
+            self.baseline_frames = tuple(self.baseline_frames)
+        if isinstance(self.clip, list):
+            self.clip = tuple(self.clip)
+        if self.baseline_frames is not None:
+            if len(self.baseline_frames) != 2:
+                raise ValueError(
+                    f"dff.baseline_frames must have 2 elements (start, end), "
+                    f"got {self.baseline_frames}"
+                )
+            if self.baseline_frames[0] > self.baseline_frames[1]:
+                raise ValueError(
+                    f"dff.baseline_frames start must be <= end, "
+                    f"got {self.baseline_frames}"
+                )
+        if self.clip is not None:
+            if len(self.clip) != 2:
+                raise ValueError(
+                    f"dff.clip must have 2 elements (min, max), got {self.clip}"
+                )
+            if self.clip[0] >= self.clip[1]:
+                raise ValueError(
+                    f"dff.clip min must be < max, got {self.clip}"
+                )
+
+
+@dataclass
+class ProjectionSettings:
+    """Settings for activity summary projection images.
+
+    Generates epoch-based projections (baseline mean, odor mean, post mean,
+    odor std, optional RGB composite) to help distinguish active glomeruli.
+    """
+    enabled: bool = False
+    save_png: bool = True
+    save_tiff: bool = False
+    make_rgb_epochs: bool = True
+    post_frames: Optional[int] = None  # cap post-odor epoch length; None = all
+    p_lo: float = 1.0
+    p_hi: float = 99.0
+    gamma: float = 1.0
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.p_lo < self.p_hi <= 100.0:
+            raise ValueError(
+                f"projections percentile bounds invalid: p_lo={self.p_lo}, p_hi={self.p_hi}"
+            )
+        if self.gamma <= 0:
+            raise ValueError(f"projections.gamma must be positive, got {self.gamma}")
+        if self.post_frames is not None and self.post_frames < 1:
+            raise ValueError(
+                f"projections.post_frames must be >= 1 or null, got {self.post_frames}"
+            )
+
+
+@dataclass
 class RegistrationSettings:
     """Settings for image registration."""
     enabled: bool = True
@@ -222,6 +314,8 @@ class OverlayConfig:
     registration: RegistrationSettings = field(default_factory=RegistrationSettings)
     annotation: AnnotationSettings = field(default_factory=AnnotationSettings)
     timing: TimingSettings = field(default_factory=TimingSettings)
+    dff: DffSettings = field(default_factory=DffSettings)
+    projections: ProjectionSettings = field(default_factory=ProjectionSettings)
 
     def __post_init__(self) -> None:
         # Convert strings to Path objects
@@ -270,6 +364,16 @@ def _parse_nested_config(data: dict, key: str, cls: type) -> Any:
         bf = section["baseline_frames"]
         if isinstance(bf, list):
             section["baseline_frames"] = tuple(bf)
+
+    if cls == DffSettings:
+        if "baseline_frames" in section:
+            bf = section["baseline_frames"]
+            if isinstance(bf, list):
+                section["baseline_frames"] = tuple(bf)
+        if "clip" in section:
+            c = section["clip"]
+            if isinstance(c, list):
+                section["clip"] = tuple(c)
 
     # Convert string values to appropriate numeric types
     # YAML sometimes parses scientific notation (1e-5) as strings
@@ -379,6 +483,8 @@ def load_config(
         registration=_parse_nested_config(data, "registration", RegistrationSettings),
         annotation=_parse_annotation_config(data),
         timing=_parse_nested_config(data, "timing", TimingSettings),
+        dff=_parse_nested_config(data, "dff", DffSettings),
+        projections=_parse_nested_config(data, "projections", ProjectionSettings),
     )
 
     config.validate()

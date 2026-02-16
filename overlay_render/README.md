@@ -152,6 +152,11 @@ python -m overlay_render --folder /path/to/trial/ --recording-only
 # Filter specific odor types
 python -m overlay_render --folder /path/to/experiment/ --filter OFM_E
 
+# Also create one synchronized all-trials comparison video
+python -m overlay_render --folder /path/to/experiment/ \
+  --combined-video \
+  --combined-sync odor_on
+
 # Override config parameters via CLI
 python -m overlay_render --folder /path/to/trial/ \
   --view.gamma 1.5 \
@@ -188,6 +193,12 @@ Running the pipeline creates three files per trial:
 Trial_001_OFM_E_123456_overlay.mp4       # Annotated video
 Trial_001_OFM_E_123456_report.json       # Processing parameters and metrics
 Trial_001_OFM_E_123456_thumbnail.png     # Representative frame thumbnail
+```
+
+If `--combined-video` is used in folder mode, one additional file is written:
+
+```
+all_trials_overlay_synced.mp4            # Grid video aligned by odor onset (or start)
 ```
 
 ---
@@ -671,4 +682,3 @@ python -m overlay_render --preview --folder trial_folder/ \
 - Train longer (100+ epochs)
 - Check data quality (sufficient frames, good SNR)
 - Try different `--learning_rate` (e.g., 0.0002 or 0.0008)
-

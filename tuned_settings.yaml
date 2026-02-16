@@ -3,12 +3,22 @@
 
 view:
   method: percentile
-  p_lo: 39
+  p_lo: 92
   p_hi: 100
   gamma: 1.0
   clahe: true
+bleach_correction:
+  enabled: true
+  method: exp_global
+  baseline_frames: 30
+  apply_mode: divide
 denoise:
   enabled: true
   method: bilateral
   strength: 50.0
   device: auto
+projections:
+  enabled: true
+  save_png: true
+  save_tiff: false
+  make_rgb_epochs: true
