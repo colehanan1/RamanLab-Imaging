@@ -23,17 +23,18 @@ def _load_fps_from_trial(trial_dir: Path) -> float:
     if trial_json.exists():
         with open(trial_json, "r") as f:
             meta = json.load(f)
-        return float(meta.get("fps", 9.0))
+        if meta.get("fps") is not None:
+            return float(meta["fps"])
+        acq = meta.get("acquisition", {})
+        if acq.get("fps_measured") is not None:
+            return float(acq["fps_measured"])
+        if acq.get("fps_target") is not None:
+            return float(acq["fps_target"])
     return 9.0
 
 
-def _load_frame_stack(trial_dir: Path) -> np.ndarray:
-    """Load all frames from trial_dir/images/images/ into a (T, H, W) array."""
-    try:
-        import tifffile
-    except ImportError:
-        raise ImportError("tifffile is required. Install with: pip install tifffile")
-
+def _get_frame_files(trial_dir: Path) -> list[Path]:
+    """Return sorted frame paths from trial_dir/images/images/."""
     frames_dir = trial_dir / "images" / "images"
     if not frames_dir.exists():
         raise FileNotFoundError(
@@ -43,9 +44,26 @@ def _load_frame_stack(trial_dir: Path) -> np.ndarray:
     frame_files = sorted(frames_dir.glob("frame_*.tif"))
     if not frame_files:
         raise FileNotFoundError(f"No frame_*.tif files found in {frames_dir}")
+    return frame_files
 
-    frames = [tifffile.imread(str(f)) for f in frame_files]
-    return np.stack(frames, axis=0)  # (T, H, W)
+
+def _write_frame_stack_tiff(trial_dir: Path, output_tiff: Path) -> tuple[int, int, int]:
+    """Stream individual TIFF frames into one multi-page TIFF for CaImAn."""
+    try:
+        import tifffile
+    except ImportError:
+        raise ImportError("tifffile is required. Install with: pip install tifffile")
+
+    frame_files = _get_frame_files(trial_dir)
+    first = tifffile.imread(str(frame_files[0]))
+    H, W = first.shape[:2]
+
+    with tifffile.TiffWriter(str(output_tiff), bigtiff=True) as tif:
+        tif.write(first)
+        for f in frame_files[1:]:
+            tif.write(tifffile.imread(str(f)))
+
+    return len(frame_files), H, W
 
 
 def run_caiman(
@@ -98,17 +116,14 @@ def run_caiman(
 
     fps = _load_fps_from_trial(trial_dir)
 
-    print(f"Loading frames from {trial_dir / 'images' / 'images'} ...")
-    stack = _load_frame_stack(trial_dir)  # (T, H, W)
-    T, H, W = stack.shape
-    print(f"  Loaded {T} frames, shape ({H}, {W})")
+    print(f"Preparing frame stack from {trial_dir / 'images' / 'images'} ...")
 
-    # Save as memory-mapped TIFF for CaImAn
+    # Stream frames into a single TIFF for CaImAn without loading the whole movie at once
     tmp_dir = Path(tempfile.mkdtemp(prefix="caiman_input_"))
     try:
-        import tifffile
         tmp_tiff = tmp_dir / "frames.tif"
-        tifffile.imwrite(str(tmp_tiff), stack)
+        T, H, W = _write_frame_stack_tiff(trial_dir, tmp_tiff)
+        print(f"  Prepared {T} frames, shape ({H}, {W})")
         fnames = [str(tmp_tiff)]
 
         # Build CaImAn parameters
@@ -143,6 +158,7 @@ def run_caiman(
             "quality": {
                 "min_SNR": 2.0,
                 "rval_thr": 0.85,
+                "use_cnn": False,
             },
         }
 
@@ -182,10 +198,14 @@ def run_caiman(
             # Run CNMF
             print("Running CNMF ...")
             cnmf_obj = cnmf.CNMF(n_processes=1, params=opts, dview=dview)
-            cnmf_obj = cnmf_obj.fit(images)
+            fit_result = cnmf_obj.fit(images)
+            if fit_result is not None:
+                cnmf_obj = fit_result
 
             # Evaluate components
             print("Evaluating components ...")
+            if cnmf_obj.estimates is None:
+                raise RuntimeError("CaImAn fit completed but produced no estimates")
             cnmf_obj.estimates.evaluate_components(images, opts, dview=dview)
 
         finally:
